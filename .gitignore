@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+# local-only test files: never commit these
+config.local.json
+data/snapshot.sample.json

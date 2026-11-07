@@ -1,0 +1,14 @@
+{
+  "name": "loot-follies-geosphere",
+  "private": true,
+  "type": "module",
+  "description": "Public globe viewer for the Loot Follies, plus the job that snapshots the contracts.",
+  "scripts": {
+    "snapshot": "node scripts/snapshot.mjs",
+    "sample": "node scripts/make-sample-snapshot.mjs",
+    "local-proxy": "node scripts/local-proxy.mjs"
+  },
+  "dependencies": {
+    "ethers": "6.13.4"
+  }
+}

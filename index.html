@@ -1,0 +1,1436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Loot Follies Geosphere</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=League+Gothic&family=Oswald:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"></script>
+<link rel="stylesheet" href="globe-viewer.css">
+</head>
+<body class="booting">
+
+<canvas class="starfield" id="starfield"></canvas>
+
+<div class="title-block">
+  <h1>The Loot Follies<br>Geosphere</h1>
+  <p class="subtitle" id="subtitle">Plots each token by its on-chain Equatorial Coordinates trait onto a rotatable globe, read live from a local Anvil node.</p>
+</div>
+
+<div class="right-col">
+  <div class="load-card">
+    <h2>Network</h2>
+    <div>
+      <label for="rpcUrl">RPC URL</label>
+      <input type="text" id="rpcUrl" value="http://127.0.0.1:8545">
+    </div>
+    <div>
+      <label for="contractAddress">Contract Address</label>
+      <input type="text" id="contractAddress" placeholder="0x...">
+    </div>
+    <div class="status" id="status" title="Click to dismiss"></div>
+    <button id="loadBtn">Load Collection</button>
+  </div>
+
+  <div class="legend" id="legend">
+    <div class="wallet-filter" id="walletFilter">
+      <label for="walletInput">Filter by wallet</label>
+      <div class="filter-row">
+        <input type="text" id="walletInput" placeholder="0x... wallet address" spellcheck="false" autocomplete="off">
+        <button type="button" class="filter-clear" id="walletClear" title="Turn filter off" aria-label="Turn wallet filter off">&times;</button>
+      </div>
+      <div class="filter-note" id="filterNote"></div>
+    </div>
+
+    <details class="adv-filters" id="advFilters">
+      <summary>Order &amp; Use filters <span class="adv-badge" id="advBadge"></span></summary>
+      <div class="fgroup">
+        <div class="fgroup-head"><span>Use</span><span class="fbtns"><button type="button" data-set="use" data-mode="all">All</button><button type="button" data-set="use" data-mode="none">None</button></span></div>
+        <div class="checks" id="useChecks"></div>
+      </div>
+      <div class="fgroup">
+        <div class="fgroup-head"><span>Order</span><span class="fbtns"><button type="button" data-set="order" data-mode="all">All</button><button type="button" data-set="order" data-mode="none">None</button></span></div>
+        <div class="checks two-col" id="orderChecks"></div>
+      </div>
+    </details>
+    <div class="shown-count" id="shownCount"></div>
+
+    <h3 class="legend-title">Collections<span class="filter-badge" id="filterBadge"></span></h3>
+    <ul id="legendList"></ul>
+    <div class="snap-note" id="snapNote"></div>
+  </div>
+</div>
+
+<div class="globe-stage" id="globeStage">
+  <canvas id="globeCanvas"></canvas>
+  <div class="empty-state" id="emptyState">Load a collection to plot it.</div>
+</div>
+
+<div class="bottom-bar">
+  <a href="https://www.folliesproject.com/" target="_blank" rel="noopener noreferrer">The Follies Project</a>
+  <span>
+    <span class="hint-mouse">Drag to rotate &nbsp;|&nbsp; Scroll to zoom &nbsp;|&nbsp; Click marker for details</span>
+    <span class="hint-touch">Drag to rotate &nbsp;|&nbsp; Pinch to zoom &nbsp;|&nbsp; Tap marker for details</span>
+  </span>
+</div>
+
+<div class="popup-overlay" id="popupOverlay">
+  <div class="popup-card">
+    <div class="popup-header" style="padding: 8px 8px 0 0;">
+      <span></span>
+      <button class="popup-close" id="popupCloseBtn">&times;</button>
+    </div>
+    <div class="popup-visual" id="popupVisual"></div>
+    <div class="popup-body">
+      <div class="popup-name" id="popupName"></div>
+      <div class="popup-row" id="popupCollection"></div>
+      <div class="popup-row" id="popupId"></div>
+      <div class="popup-row" id="popupOwner"></div>
+      <div class="popup-row" id="popupCoords"></div>
+      <div class="popup-row" id="popupTraits"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ---------------- shared plumbing ---------------- */
+
+const statusEl = document.getElementById('status');
+const loadBtn = document.getElementById('loadBtn');
+const emptyStateEl = document.getElementById('emptyState');
+const legendEl = document.getElementById('legend');
+const legendListEl = document.getElementById('legendList');
+const walletInput = document.getElementById('walletInput');
+const walletClear = document.getElementById('walletClear');
+const walletFilterEl = document.getElementById('walletFilter');
+const filterNote = document.getElementById('filterNote');
+const filterBadge = document.getElementById('filterBadge');
+const shownCountEl = document.getElementById('shownCount');
+const advBadge = document.getElementById('advBadge');
+const advFilters = document.getElementById('advFilters');
+const snapNoteEl = document.getElementById('snapNote');
+
+// The log stays hidden until something is loading or fails. After a clean load it
+// fades out on its own; if anything errored it stays up until you click it.
+let logHideTimer = null;
+let logHadError = false;
+
+function log(msg, cls) {
+  clearTimeout(logHideTimer);
+  statusEl.style.display = 'block';
+  if (cls === 'err') logHadError = true;
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  statusEl.appendChild(line);
+  statusEl.scrollTop = statusEl.scrollHeight;
+}
+function clearLog() {
+  clearTimeout(logHideTimer);
+  statusEl.innerHTML = '';
+  statusEl.style.display = 'none';
+  logHadError = false;
+}
+function scheduleLogHide() {
+  if (logHadError) return;
+  logHideTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+}
+statusEl.addEventListener('click', () => { statusEl.style.display = 'none'; });
+
+const ERC721_ABI = [
+  "function totalSupply() view returns (uint256)",
+  "function tokenByIndex(uint256 index) view returns (uint256)",
+  "function tokenURI(uint256 tokenId) view returns (string)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
+  "function name() view returns (string)",
+  "function symbol() view returns (string)"
+];
+
+const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
+
+// atob() decodes base64 to a Latin-1 "binary string" - one JS char per byte, NOT proper
+// UTF-8 decoding. Any multi-byte UTF-8 character (e.g. the α/δ symbols this contract embeds
+// in the Equatorial Coordinates trait) comes out mangled unless re-decoded as UTF-8 bytes.
+function base64ToUtf8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function decodeTokenURI(uri) {
+  if (uri.startsWith("data:application/json;base64,")) {
+    const b64 = uri.slice("data:application/json;base64,".length);
+    return JSON.parse(base64ToUtf8(b64));
+  }
+  if (uri.startsWith("data:application/json,")) {
+    const raw = uri.slice("data:application/json,".length);
+    return JSON.parse(decodeURIComponent(raw));
+  }
+  throw new Error("tokenURI is not an on-chain data: JSON URI (got: " + uri.slice(0, 40) + "...)");
+}
+
+function resolveGenericUri(uri) {
+  if (uri.startsWith("ipfs://")) return "https://ipfs.io/ipfs/" + uri.slice(7);
+  return uri;
+}
+
+function decodeDataUri(uri) {
+  const match = uri.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/);
+  if (!match) return null;
+  const mime = match[1] || "text/plain";
+  const isB64 = !!match[2];
+  const payload = match[3];
+  const text = isB64 ? base64ToUtf8(payload) : decodeURIComponent(payload);
+  return { mime, text };
+}
+
+// NB: the closing tags below are deliberately written with a backslash before the slash. Tools such as
+// VS Code Live Server inject their reload script at the first literal closing-body tag in the file, and
+// a literal one inside this script would make them inject mid-string and break the page.
+const IFRAME_SVG_SHELL_HEAD = '<!doctype html><html><head><meta charset="utf-8"/><style>html, body { margin: 0; padding: 0; background: black; width: 100%; height: 100%; } svg { width: 100%; height: 100%; }</style><\/head><body>';
+const IFRAME_SVG_SHELL_TAIL = '<\/body><\/html>';
+
+function buildIframe(srcdocHtml) {
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('sandbox', '');
+  iframe.loading = 'lazy';
+  iframe.srcdoc = srcdocHtml;
+  return iframe;
+}
+
+function buildVisualNode(metadata) {
+  if (metadata.animation_url) {
+    if (metadata.animation_url.startsWith("data:")) {
+      const decoded = decodeDataUri(metadata.animation_url);
+      if (decoded) return buildIframe(decoded.text);
+    } else {
+      const iframe = document.createElement('iframe');
+      iframe.setAttribute('sandbox', '');
+      iframe.src = resolveGenericUri(metadata.animation_url);
+      return iframe;
+    }
+  }
+  const image = metadata.image;
+  if (image) {
+    if (image.startsWith("data:image/svg+xml")) {
+      const decoded = decodeDataUri(image);
+      if (decoded) return buildIframe(IFRAME_SVG_SHELL_HEAD + decoded.text + IFRAME_SVG_SHELL_TAIL);
+    }
+    if (image.startsWith("<svg")) {
+      return buildIframe(IFRAME_SVG_SHELL_HEAD + image + IFRAME_SVG_SHELL_TAIL);
+    }
+    const img = document.createElement('img');
+    img.src = resolveGenericUri(image);
+    img.alt = metadata.name || "";
+    return img;
+  }
+  const empty = document.createElement('div');
+  empty.textContent = 'No visual';
+  return empty;
+}
+
+async function discoverTokenIdsViaLogs(provider, contractAddress) {
+  const logs = await provider.getLogs({
+    address: contractAddress,
+    fromBlock: 0,
+    toBlock: "latest",
+    topics: [TRANSFER_TOPIC]
+  });
+  const ids = new Set();
+  const iface = new ethers.Interface(ERC721_ABI.concat([
+    "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
+  ]));
+  for (const l of logs) {
+    try {
+      const parsed = iface.parseLog(l);
+      ids.add(parsed.args[2].toString());
+    } catch (e) { /* skip non-matching logs */ }
+  }
+  return Array.from(ids);
+}
+
+/* ---------------- coordinate parsing ---------------- */
+
+// Parses the "Equatorial Coordinates" trait, formatted by the contract as
+// "α=HH:MM:SS; δ=±DD" (α = right ascension, δ = declination).
+// Returns null when the trait is missing or isn't in that format, so contracts
+// (or individual tokens) without positioning data are simply skipped.
+function parseEquatorialCoordinates(metadata) {
+  const attrs = Array.isArray(metadata && metadata.attributes) ? metadata.attributes : [];
+  const attr = attrs.find(a => a && a.trait_type === "Equatorial Coordinates");
+  if (!attr || typeof attr.value !== 'string') return null;
+
+  const m = attr.value.match(/α\s*=\s*(\d+):(\d+):(\d+)\s*;\s*δ\s*=\s*(-?\d+)/);
+  if (!m) return null;
+
+  const h = parseInt(m[1], 10), mm = parseInt(m[2], 10), ss = parseInt(m[3], 10);
+  const decDeg = parseInt(m[4], 10);
+  const raDeg = ((h + mm / 60 + ss / 3600) / 24) * 360;
+
+  return { raDeg, decDeg, raw: attr.value };
+}
+
+// Longitude-style angle -> unit vector. Increasing angle (right ascension) runs left-to-right
+// across the face of the globe, and right ascension 0h faces you by default.
+function toUnitVector(raDeg, decDeg) {
+  const lambda = raDeg * Math.PI / 180;
+  const phi = decDeg * Math.PI / 180;
+  return {
+    x: Math.cos(phi) * Math.cos(lambda),
+    y: Math.sin(phi),
+    z: -Math.cos(phi) * Math.sin(lambda)
+  };
+}
+
+/* ---------------- Order / Use traits ---------------- */
+
+const ORDER_NAMES = ['Power', 'Giants', 'Titans', 'Skill', 'Perfection', 'Brilliance', 'Enlightenment',
+  'Protection', 'Anger', 'Rage', 'Fury', 'Vitriol', 'The Fox', 'Detection', 'Reflection', 'The Twins'];
+const ORDER_KEYS = [...Array(16).keys(), 'U'];     // 0-15, plus 'U' for "Unordered"
+
+const USE_GROUPS = [
+  { label: 'Attributes Impact',            lo: 0,  hi: 3 },
+  { label: 'Attributes & Dynamics Impact', lo: 4,  hi: 7 },
+  { label: 'Dynamics Impact',              lo: 8,  hi: 11 },
+  { label: 'Dynamics & Story Impact',      lo: 12, hi: 15 },
+  { label: 'Story Impact',                 lo: 16, hi: 19 },
+  { label: 'Story & Attributes Impact',    lo: 20, hi: 23 }
+];
+
+function getTraitValue(metadata, traitType) {
+  const attrs = Array.isArray(metadata && metadata.attributes) ? metadata.attributes : [];
+  const attr = attrs.find(a => a && a.trait_type === traitType);
+  return attr ? attr.value : undefined;
+}
+// Order: 0-15, or 'U' for the literal value "Unordered". Missing/unrecognised -> null (no data).
+function parseOrderTrait(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (/^unordered$/i.test(s)) return 'U';
+  if (/^\d+$/.test(s)) { const n = parseInt(s, 10); return n <= 15 ? n : null; }
+  return null;
+}
+// Use: 0-23. Missing/unrecognised -> null (no data).
+function parseUseTrait(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!/^\d+$/.test(s)) return null;
+  const n = parseInt(s, 10);
+  return n <= 23 ? n : null;
+}
+function useGroupOf(use) { return use === null || use === undefined ? null : Math.floor(use / 4); }
+function describeOrder(o) { return o === null || o === undefined ? '' : (o === 'U' ? 'Unordered' : o + ' · ' + ORDER_NAMES[o]); }
+function describeUse(u) { return u === null || u === undefined ? '' : USE_GROUPS[useGroupOf(u)].label + ' (' + u + ')'; }
+
+function makeToken(f) {
+  return {
+    id: f.id, owner: f.owner, metadata: f.metadata || null, name: f.name || '',
+    coords: f.coords, unit: toUnitVector(f.coords.raDeg, f.coords.decDeg),
+    color: f.collection.color, collection: f.collection,
+    order: f.order === undefined ? null : f.order,
+    use: f.use === undefined ? null : f.use,
+    useGroup: useGroupOf(f.use)
+  };
+}
+
+/* ---------------- collections ---------------- */
+
+// One entry per loaded contract: { key, address, rpcUrl, name, symbol, color,
+//   tokens:[...], plotted, skipped, failed }
+let collections = [];
+let tokens = [];   // tokens currently plotted: all collections' tokens, narrowed by the wallet filter
+let walletFilter = '';   // lowercase 0x address when the filter is on, otherwise ''
+
+const WALLET_RE = /^0x[0-9a-fA-F]{40}$/;
+function ownedByWallet(t) { return !walletFilter || String(t.owner).toLowerCase() === walletFilter; }
+
+// Order / Use checkboxes: everything starts on. A token with no Order (or Use) data ignores
+// that filter, so contracts without those traits don't vanish when you narrow it.
+let orderOn = new Set(ORDER_KEYS);
+let useOn = new Set(USE_GROUPS.map((_, i) => i));
+// Each collection also has an on/off switch of its own (the checkbox in the Collections list).
+function passesFilters(t) {
+  return t.collection.enabled !== false
+    && ownedByWallet(t)
+    && (t.order === null || orderOn.has(t.order))
+    && (t.useGroup === null || useOn.has(t.useGroup));
+}
+function filtersActive() {
+  return !!walletFilter || orderOn.size < ORDER_KEYS.length || useOn.size < USE_GROUPS.length
+    || collections.some(c => c.enabled === false);
+}
+
+const COLLECTION_COLORS = ['#7c9cff', '#ffb454', '#5fd3a1', '#f27ca5', '#b58cff', '#4fd0e0', '#e6e26b', '#ff8a5c'];
+
+function nextCollectionColor() {
+  const used = new Set(collections.map(c => c.color));
+  for (const c of COLLECTION_COLORS) if (!used.has(c)) return c;
+  return COLLECTION_COLORS[collections.length % COLLECTION_COLORS.length];
+}
+
+function rebuildTokens() {
+  tokens = collections.flatMap(c => c.tokens).filter(passesFilters);
+}
+
+function updateButtonLabel() {
+  loadBtn.textContent = collections.length ? 'Add Collection' : 'Load Collection';
+}
+
+let emptyIdleText = 'Load a collection to plot it.';
+function refreshEmptyState() {
+  if (tokens.length) {
+    emptyStateEl.style.display = 'none';
+  } else {
+    emptyStateEl.style.display = 'block';
+    emptyStateEl.textContent = (filtersActive() && collections.length)
+      ? 'No tokens match the current filters.'
+      : emptyIdleText;
+  }
+}
+
+function shortAddress(a) { return a.slice(0, 6) + '…' + a.slice(-4); }
+function rpcLabel(url) {
+  try { return new URL(url).host || url; } catch { return url; }
+}
+
+function renderLegend() {
+  legendListEl.innerHTML = '';
+  for (const c of collections) {
+    const li = document.createElement('li');
+    const isOn = c.enabled !== false;
+    li.classList.toggle('off', !isOn);
+
+    // On/off switch: untick to hide this contract's tokens from the globe.
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.className = 'legend-check';
+    chk.checked = isOn;
+    chk.title = isOn ? 'Showing - untick to hide this contract' : 'Hidden - tick to show this contract';
+    chk.setAttribute('aria-label', 'Show ' + (c.name || 'collection') + ' on the globe');
+    chk.addEventListener('change', () => {
+      c.enabled = chk.checked;
+      if (popupToken && popupToken.collection === c && !c.enabled) closePopup();
+      applyFilters();
+    });
+    li.appendChild(chk);
+
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = c.color;
+    li.appendChild(swatch);
+
+    const text = document.createElement('div');
+    text.className = 'legend-text';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'legend-name';
+    nameEl.textContent = (c.name || 'Collection') + (c.symbol ? ' (' + c.symbol + ')' : '');
+    const subEl = document.createElement('div');
+    subEl.className = 'legend-sub';
+    let counts = !isOn
+      ? 'hidden · ' + c.plotted.toLocaleString() + ' tokens'
+      : filtersActive()
+        ? c.tokens.filter(passesFilters).length.toLocaleString() + ' of ' + c.plotted.toLocaleString() + ' shown'
+        : c.plotted.toLocaleString() + ' plotted';
+    if (c.skipped) counts += ' · ' + c.skipped + ' skipped';
+    if (c.failed) counts += ' · ' + c.failed + ' failed';
+    subEl.textContent = counts + ' · ' + shortAddress(c.address) + ' · ' + (c.sourceLabel || rpcLabel(c.rpcUrl));
+    text.appendChild(nameEl);
+    text.appendChild(subEl);
+    li.appendChild(text);
+
+    const rm = document.createElement('button');
+    rm.className = 'legend-remove';
+    rm.type = 'button';
+    rm.title = 'Remove this collection';
+    rm.setAttribute('aria-label', 'Remove ' + (c.name || 'collection'));
+    rm.textContent = '×';
+    rm.addEventListener('click', () => removeCollection(c.key));
+    li.appendChild(rm);
+
+    legendListEl.appendChild(li);
+  }
+  legendEl.classList.toggle('has-items', collections.length > 0);
+  legendEl.classList.toggle('filtered', !!walletFilter);
+  filterBadge.textContent = walletFilter ? '· ' + shortAddress(walletFilter) : '';
+  updateFilterSummary();
+}
+
+function updateFilterSummary() {
+  const total = collections.reduce((s, c) => s + c.tokens.length, 0);
+  shownCountEl.textContent = filtersActive() ? 'Showing ' + tokens.length.toLocaleString() + ' of ' + total.toLocaleString() + ' tokens' : '';
+  const off = (USE_GROUPS.length - useOn.size) + (ORDER_KEYS.length - orderOn.size);
+  advBadge.textContent = off ? off + ' off' : '';
+}
+
+/* ---------------- wallet filter ---------------- */
+
+function setFilterNote(text, isErr) {
+  filterNote.textContent = text;
+  filterNote.classList.toggle('show', !!text);
+  filterNote.classList.toggle('err', !!isErr);
+}
+
+function applyWalletFilter() {
+  const raw = walletInput.value.trim();
+  walletFilterEl.classList.toggle('has-text', raw.length > 0);
+
+  if (!raw) {
+    walletFilter = '';
+    setFilterNote('');
+  } else if (WALLET_RE.test(raw)) {
+    walletFilter = raw.toLowerCase();
+    const n = collections.reduce((s, c) => s + c.tokens.filter(ownedByWallet).length, 0);
+    setFilterNote(n + ' token' + (n === 1 ? '' : 's') + ' in this wallet · clear (×) to show all');
+  } else {
+    // Incomplete or malformed: filter stays off so nothing looks stuck.
+    walletFilter = '';
+    setFilterNote('Enter a full wallet address (0x + 40 hex characters).', true);
+  }
+
+  applyFilters();
+}
+
+function applyFilters() {
+  rebuildTokens();
+  renderLegend();
+  refreshEmptyState();
+  draw();
+}
+
+function makeCheck(kind, key, text, hint) {
+  const label = document.createElement('label');
+  label.className = 'chk';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = true;
+  input.dataset.kind = kind;
+  input.dataset.key = String(key);
+  const span = document.createElement('span');
+  span.textContent = text;
+  label.appendChild(input);
+  label.appendChild(span);
+  if (hint) {
+    const hs = document.createElement('em');
+    hs.textContent = hint;
+    label.appendChild(hs);
+  }
+  return label;
+}
+(function buildFilterChecks() {
+  const useBox = document.getElementById('useChecks');
+  USE_GROUPS.forEach((g, i) => useBox.appendChild(makeCheck('use', i, g.label, g.lo + '–' + g.hi)));
+  const orderBox = document.getElementById('orderChecks');
+  ORDER_KEYS.forEach(k => orderBox.appendChild(makeCheck('order', k, k === 'U' ? 'Unordered' : k + ' · ' + ORDER_NAMES[k])));
+})();
+
+advFilters.addEventListener('change', (e) => {
+  const input = e.target;
+  if (!input || input.type !== 'checkbox') return;
+  const key = input.dataset.key === 'U' ? 'U' : Number(input.dataset.key);
+  const set = input.dataset.kind === 'use' ? useOn : orderOn;
+  if (input.checked) set.add(key); else set.delete(key);
+  applyFilters();
+});
+advFilters.addEventListener('click', (e) => {
+  const btn = e.target.closest && e.target.closest('button[data-set]');
+  if (!btn) return;
+  const isUse = btn.dataset.set === 'use';
+  const set = isUse ? useOn : orderOn;
+  const all = isUse ? USE_GROUPS.map((_, i) => i) : ORDER_KEYS;
+  set.clear();
+  if (btn.dataset.mode === 'all') all.forEach(k => set.add(k));
+  advFilters.querySelectorAll('input[data-kind="' + (isUse ? 'use' : 'order') + '"]').forEach(i => { i.checked = btn.dataset.mode === 'all'; });
+  applyFilters();
+});
+
+function clearWalletFilter() {
+  walletInput.value = '';
+  applyWalletFilter();
+}
+
+walletInput.addEventListener('input', applyWalletFilter);
+walletClear.addEventListener('click', () => { clearWalletFilter(); walletInput.focus(); });
+
+function removeCollection(key) {
+  const gone = collections.find(c => c.key === key);
+  collections = collections.filter(c => c.key !== key);
+  if (!collections.length && (walletInput.value || walletFilter)) {
+    walletInput.value = '';
+    walletFilter = '';
+    walletFilterEl.classList.remove('has-text');
+    setFilterNote('');
+  }
+  rebuildTokens();
+  if (gone && popupToken && popupToken.collection === gone) closePopup();
+  renderLegend();
+  updateButtonLabel();
+  refreshEmptyState();
+  draw();
+}
+
+/* ---------------- backdrop: static starfield ---------------- */
+
+const starCanvas = document.getElementById('starfield');
+let lastStarSize = '';
+
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// Sparse scatter of tiny dots with a few loose clusters. Seeded, so the same stars sit
+// in the same places on every load. Painted once per window size, never animated.
+function drawStarfield() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = window.innerWidth, cssH = window.innerHeight;
+  const sig = cssW + 'x' + cssH + '@' + dpr;
+  if (sig === lastStarSize) return;
+  lastStarSize = sig;
+
+  const W = Math.max(1, Math.round(cssW * dpr)), H = Math.max(1, Math.round(cssH * dpr));
+  starCanvas.width = W;
+  starCanvas.height = H;
+  const g = starCanvas.getContext('2d');
+  g.clearRect(0, 0, W, H);
+
+  const rnd = mulberry32(20261010);
+  const count = Math.max(140, Math.min(650, Math.round(cssW * cssH / 3300)));
+  const minSide = Math.min(W, H);
+
+  const clusters = [];
+  for (let i = 0; i < 9; i++) {
+    clusters.push({ x: rnd(), y: rnd(), r: 0.035 + rnd() * 0.08 });
+  }
+
+  const tints = [
+    ['#f3e9c6', 0.52], ['#ffffff', 0.20], ['#f6dba5', 0.10], ['#bfe3d6', 0.10], ['#b9c8f0', 0.08]
+  ];
+  function pickTint() {
+    let r = rnd();
+    for (const [c, p] of tints) { if (r < p) return c; r -= p; }
+    return tints[0][0];
+  }
+
+  for (let i = 0; i < count; i++) {
+    let nx, ny;
+    if (rnd() < 0.36) {
+      const c = clusters[(rnd() * clusters.length) | 0];
+      const gx = rnd() + rnd() + rnd() - 1.5;     // roughly bell-shaped
+      const gy = rnd() + rnd() + rnd() - 1.5;
+      nx = c.x + gx * c.r * 2 * (minSide / W);
+      ny = c.y + gy * c.r * 2 * (minSide / H);
+    } else {
+      nx = rnd(); ny = rnd();
+    }
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) continue;
+
+    const s = rnd();
+    let radius;
+    if (s < 0.74) radius = 0.45 + rnd() * 0.5;
+    else if (s < 0.95) radius = 0.95 + rnd() * 0.55;
+    else radius = 1.6 + rnd() * 0.7;
+    radius *= dpr;
+
+    g.globalAlpha = (radius < 1 * dpr ? 0.35 : 0.5) + rnd() * 0.5;
+    g.fillStyle = pickTint();
+    if (radius > 1.5 * dpr) { g.shadowColor = 'rgba(255,244,214,0.8)'; g.shadowBlur = radius * 2.5; }
+    else g.shadowBlur = 0;
+    g.beginPath();
+    g.arc(nx * W, ny * H, radius, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.globalAlpha = 1;
+  g.shadowBlur = 0;
+}
+
+/* ---------------- backdrop: painterly ring (procedural) ---------------- */
+
+// Everything below is expressed in "globe radii" (1.0 = the globe's edge) so the rings
+// scale with the globe on zoom. The wide ring is painted once into an offscreen texture
+// and then just scaled each frame.
+
+const RING_TEX_SIZE = 2048;
+const RING_TEX_HALF_UNITS = 1.6;   // texture spans -1.6 .. +1.6 globe radii on each axis
+let ringTexture = null;
+
+// Irregular inner/outer edge of the wide ring, a little thicker on the left like the reference.
+function ringEdges(theta) {
+  const outer = 1.37
+    + 0.028 * Math.cos(theta - 2.6)
+    + 0.012 * Math.sin(3 * theta + 0.7)
+    + 0.008 * Math.sin(7 * theta + 2.1)
+    + 0.005 * Math.sin(19 * theta + 0.3);
+  const inner = 1.06
+    + 0.010 * Math.sin(5 * theta + 1.3)
+    + 0.006 * Math.sin(11 * theta);
+  return { outer, inner };
+}
+
+function buildRingTexture() {
+  const S = RING_TEX_SIZE, c = S / 2, k = S / (2 * RING_TEX_HALF_UNITS);
+  const tex = document.createElement('canvas');
+  tex.width = tex.height = S;
+  const t = tex.getContext('2d');
+  const rnd = mulberry32(1337);
+  const TAU = Math.PI * 2;
+
+  function annulusPath() {
+    const N = 720;
+    t.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const th = i / N * TAU, r = ringEdges(th).outer * k;
+      const x = c + Math.cos(th) * r, y = c + Math.sin(th) * r;
+      if (i === 0) t.moveTo(x, y); else t.lineTo(x, y);
+    }
+    t.closePath();
+    for (let i = N; i >= 0; i--) {
+      const th = i / N * TAU, r = ringEdges(th).inner * k;
+      const x = c + Math.cos(th) * r, y = c + Math.sin(th) * r;
+      if (i === N) t.moveTo(x, y); else t.lineTo(x, y);
+    }
+    t.closePath();
+  }
+
+  t.save();
+  annulusPath();
+  t.fillStyle = '#681310';
+  t.fill('evenodd');
+  t.clip('evenodd');
+
+  // broad, loaded brush strokes following the ring - dark, moody reds
+  const palette = ['#3a0908', '#52100d', '#6b150f', '#82190f', '#982114', '#a82a1a'];
+  t.lineCap = 'round';
+  for (let n = 0; n < 1500; n++) {
+    const a0 = rnd() * TAU, len = 0.10 + rnd() * 0.8;
+    const e = ringEdges(a0);
+    const r = (e.inner + (e.outer - e.inner) * rnd()) * k;
+    t.lineWidth = (0.02 + rnd() * 0.075) * k;
+    t.globalAlpha = 0.12 + rnd() * 0.36;
+    t.strokeStyle = palette[(rnd() * palette.length) | 0];
+    t.beginPath();
+    t.arc(c, c, r, a0, a0 + len);
+    t.stroke();
+  }
+
+  // fine bristle lines, mostly dark with a few warm highlights
+  for (let n = 0; n < 1600; n++) {
+    const a0 = rnd() * TAU, len = 0.2 + rnd() * 1.4;
+    const e = ringEdges(a0);
+    const r = (e.inner + (e.outer - e.inner) * rnd()) * k;
+    t.lineWidth = (0.002 + rnd() * 0.006) * k;
+    t.globalAlpha = 0.14 + rnd() * 0.22;
+    t.strokeStyle = rnd() < 0.7 ? '#240504' : '#b3402a';
+    t.beginPath();
+    t.arc(c, c, r, a0, a0 + len);
+    t.stroke();
+  }
+
+  // darken the edges so the ring reads as a heavy painted band
+  t.globalAlpha = 0.5;
+  t.strokeStyle = '#240504';
+  t.lineWidth = 0.03 * k;
+  annulusPath();
+  t.stroke();
+  t.restore();
+
+  // edge lookup by angle, for ragged dry-brush edges below
+  const BINS = 3600;
+  const outerAt = new Float32Array(BINS), innerAt = new Float32Array(BINS);
+  for (let i = 0; i < BINS; i++) {
+    const e = ringEdges(i / BINS * TAU);
+    outerAt[i] = e.outer; innerAt[i] = e.inner;
+  }
+
+  // grain: fine per-pixel noise + coarser blotches + dry-brush speckle, heavier near the edges
+  const img = t.getImageData(0, 0, S, S);
+  const d = img.data;
+  const BLOCK = 5, BW = Math.ceil(S / BLOCK);
+  const coarse = new Float32Array(BW * BW);
+  for (let i = 0; i < coarse.length; i++) coarse[i] = rnd() - 0.5;
+  for (let y = 0; y < S; y++) {
+    const by = ((y / BLOCK) | 0) * BW;
+    const dy = y - c;
+    for (let x = 0; x < S; x++) {
+      const i = (y * S + x) * 4;
+      const a = d[i + 3];
+      if (a === 0) continue;
+      const n = (rnd() - 0.5) * 0.30 + coarse[by + ((x / BLOCK) | 0)] * 0.34;
+      const f = 1 + n;
+      d[i]     = Math.max(0, Math.min(255, d[i] * f));
+      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] * f));
+      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] * f));
+
+      const dx = x - c;
+      const rr = Math.sqrt(dx * dx + dy * dy) / k;
+      let th = Math.atan2(dy, dx); if (th < 0) th += TAU;
+      const bin = ((th / TAU) * BINS) | 0;
+      const edgeDist = Math.min(outerAt[bin] - rr, rr - innerAt[bin]);
+      const speckle = edgeDist < 0.03 ? 0.30 : 0.05;
+      if (rnd() < speckle) d[i + 3] = a * (0.25 + rnd() * 0.4);
+    }
+  }
+  t.putImageData(img, 0, 0);
+  return tex;
+}
+
+/* ---------------- globe rendering ---------------- */
+
+const stage = document.getElementById('globeStage');
+const canvas = document.getElementById('globeCanvas');
+const ctx = canvas.getContext('2d');
+const stackedQuery = window.matchMedia('(max-width: 900px)');
+
+let markerHitTargets = [];    // recomputed each draw: { token, sx, sy, r }
+// Opens with the equator running flat across the middle and RA 0h facing you. yaw = -90deg - longitude puts that longitude at the centre of the disc.
+const view = { yaw: -Math.PI / 2, pitch: 0, zoom: 1 };
+function faceLongitude(deg) { view.yaw = -Math.PI / 2 - deg * Math.PI / 180; }
+// Turn the globe (left/right only) so the middle of a set of tokens faces you.
+function centerOnTokens(list) {
+  let sx = 0, sz = 0;
+  for (const t of list) {
+    const a = t.coords.raDeg * Math.PI / 180;
+    sx += Math.cos(a); sz += Math.sin(a);
+  }
+  if (!list.length || Math.hypot(sx, sz) < 1e-6 * list.length) return;
+  faceLongitude(Math.atan2(sz, sx) * 180 / Math.PI);
+}
+let dpr = window.devicePixelRatio || 1;
+
+function resizeCanvas() {
+  dpr = window.devicePixelRatio || 1;
+  const rect = stage.getBoundingClientRect();
+  const w = Math.max(1, Math.round(rect.width * dpr));
+  const h = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  drawStarfield();
+  draw();
+}
+window.addEventListener('resize', resizeCanvas);
+if (window.ResizeObserver) new ResizeObserver(resizeCanvas).observe(stage);
+
+function rotatePoint(p, yaw, pitch) {
+  let x = p.x * Math.cos(yaw) + p.z * Math.sin(yaw);
+  let z = -p.x * Math.sin(yaw) + p.z * Math.cos(yaw);
+  let y = p.y;
+  const y2 = y * Math.cos(pitch) - z * Math.sin(pitch);
+  const z2 = y * Math.sin(pitch) + z * Math.cos(pitch);
+  return { x, y: y2, z: z2 };
+}
+
+function drawGraticule(cx, cy, R, yaw, pitch) {
+  ctx.strokeStyle = 'rgba(223, 217, 181, 0.09)';
+  ctx.lineWidth = 1;
+
+  for (let dec = -60; dec <= 60; dec += 30) {
+    ctx.beginPath();
+    let started = false;
+    for (let ra = 0; ra <= 360; ra += 4) {
+      const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
+      if (r.z <= 0) { started = false; continue; }
+      const sx = cx + r.x * R, sy = cy - r.y * R;
+      if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+  }
+
+  for (let ra = 0; ra < 360; ra += 30) {
+    ctx.beginPath();
+    let started = false;
+    for (let dec = -90; dec <= 90; dec += 4) {
+      const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
+      if (r.z <= 0) { started = false; continue; }
+      const sx = cx + r.x * R, sy = cy - r.y * R;
+      if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+  }
+}
+
+// Thin, bright eclipse ring hugging the globe's edge.
+function drawEclipseRing(cx, cy, R) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R * 1.045, 0, Math.PI * 2);
+  ctx.lineWidth = R * 0.034;
+  ctx.strokeStyle = '#e63f2b';
+  ctx.shadowColor = 'rgba(255, 70, 40, 0.85)';
+  ctx.shadowBlur = R * 0.07;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = R * 0.013;
+  ctx.strokeStyle = '#ff7a52';
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Desktop: globe is the full-window background, nudged so the title (left) and the
+  // card column (right) stay clear of it. Stacked: globe fills its own square.
+  let cx, cy, R;
+  if (stackedQuery.matches) {
+    cx = w / 2; cy = h / 2;
+    R = Math.min(w, h) * 0.32 * view.zoom;
+  } else {
+    cx = w * 0.5; cy = h * 0.52;
+    R = Math.min(h * 0.31, w * 0.22) * view.zoom;
+  }
+
+  // 1. wide painterly ring (behind everything)
+  if (!ringTexture) ringTexture = buildRingTexture();
+  const texPx = 2 * RING_TEX_HALF_UNITS * R;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(ringTexture, cx - texPx / 2, cy - texPx / 2, texPx, texPx);
+
+  // 2. thin eclipse ring
+  drawEclipseRing(cx, cy, R);
+
+  // 3. globe disk, shaded so it reads as a sphere
+  const grad = ctx.createRadialGradient(cx - R * 0.35, cy - R * 0.35, R * 0.1, cx, cy, R);
+  grad.addColorStop(0, '#1c2030');
+  grad.addColorStop(1, '#090a0d');
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(223, 217, 181, 0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  drawGraticule(cx, cy, R, view.yaw, view.pitch);
+
+  // 4. markers: front-facing only. Tuned so 10,000+ tokens stay smooth: dots shrink as the
+  // count grows, are batched per collection colour, and labels only appear when few are on screen.
+  const cyw = Math.cos(view.yaw), syw = Math.sin(view.yaw), cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  const visible = [];
+  let onScreen = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const u = tokens[i].unit;
+    const x1 = u.x * cyw + u.z * syw;
+    const z1 = -u.x * syw + u.z * cyw;
+    const z2 = u.y * sp + z1 * cp;
+    if (z2 <= 0) continue;
+    const sx = cx + x1 * R, sy = cy - (u.y * cp - z1 * sp) * R;
+    visible.push({ t: tokens[i], sx, sy, z: z2 });
+    if (sx > 0 && sx < w && sy > 0 && sy < h) onScreen++;
+  }
+  if (visible.length <= 1500) visible.sort((a, b) => a.z - b.z);   // nearer on top when it matters
+
+  markerHitTargets = [];
+  const n = tokens.length;
+  const sizeFactor = n > 3000 ? 0.38 : n > 1000 ? 0.55 : n > 300 ? 0.75 : 1;
+  const dotR = Math.max(1.5, Math.min(6, R * 0.02 * sizeFactor)) * dpr;
+  const hitPad = (n > 1000 ? 3 : 6) * dpr;
+
+  const byColor = new Map();
+  for (const v of visible) {
+    if (v.sx < -20 || v.sx > w + 20 || v.sy < -20 || v.sy > h + 20) continue;
+    let path = byColor.get(v.t.color);
+    if (!path) { path = new Path2D(); byColor.set(v.t.color, path); }
+    path.moveTo(v.sx + dotR, v.sy);
+    path.arc(v.sx, v.sy, dotR, 0, Math.PI * 2);
+    markerHitTargets.push({ token: v.t, sx: v.sx, sy: v.sy, r: dotR + hitPad });
+  }
+  for (const [color, path] of byColor) {
+    ctx.fillStyle = color;
+    ctx.fill(path);
+    if (n <= 1500) {
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 1;
+      ctx.stroke(path);
+    }
+  }
+
+  if (onScreen <= 150 || (view.zoom >= 2.5 && onScreen <= 400)) {
+    ctx.font = (11 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e8eaed';
+    for (const m of markerHitTargets) ctx.fillText('#' + m.token.id, m.sx + dotR + 4, m.sy);
+  }
+}
+
+/* ---------------- interaction (mouse + touch via pointer events) ---------------- */
+
+// One finger / mouse drag rotates, two fingers pinch-zoom, a tap or click on a marker
+// opens its popup.
+const pointers = new Map();     // pointerId -> {x, y}
+let moveAcc = 0, dragMoved = false, tapCandidate = false;
+let pinchStartDist = 0, pinchStartZoom = 1;
+
+function clampZoom(z) { return Math.max(0.4, Math.min(4, z)); }
+
+canvas.addEventListener('pointerdown', (e) => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.classList.add('dragging');
+  if (pointers.size === 1) {
+    moveAcc = 0; dragMoved = false; tapCandidate = true;
+  } else if (pointers.size === 2) {
+    tapCandidate = false; dragMoved = true;
+    const [a, b] = [...pointers.values()];
+    pinchStartDist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    pinchStartZoom = view.zoom;
+  }
+});
+
+window.addEventListener('pointermove', (e) => {
+  const prev = pointers.get(e.pointerId);
+  if (!prev) return;
+  const cur = { x: e.clientX, y: e.clientY };
+  pointers.set(e.pointerId, cur);
+
+  if (pointers.size === 1) {
+    const dx = cur.x - prev.x, dy = cur.y - prev.y;
+    moveAcc += Math.abs(dx) + Math.abs(dy);
+    if (moveAcc > 6) dragMoved = true;
+    view.yaw += dx * 0.006;
+    view.pitch = Math.max(-1.5, Math.min(1.5, view.pitch + dy * 0.006));
+    draw();
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    view.zoom = clampZoom(pinchStartZoom * dist / pinchStartDist);
+    draw();
+  }
+});
+
+function endPointer(e) {
+  if (!pointers.has(e.pointerId)) return;
+  const wasOnly = pointers.size === 1;
+  pointers.delete(e.pointerId);
+  if (wasOnly && tapCandidate && !dragMoved && e.type === 'pointerup') handleCanvasClick(e);
+  if (pointers.size === 0) {
+    canvas.classList.remove('dragging');
+    tapCandidate = false;
+  }
+}
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  view.zoom = clampZoom(view.zoom * (1 - e.deltaY * 0.001));
+  draw();
+}, { passive: false });
+
+function handleCanvasClick(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cxClick = (e.clientX - rect.left) * dpr;
+  const cyClick = (e.clientY - rect.top) * dpr;
+  const slack = e.pointerType === 'touch' ? 2.2 : 1;   // fingers are less precise than a mouse
+
+  let best = null, bestDist = Infinity;
+  for (const m of markerHitTargets) {
+    const d = Math.hypot(m.sx - cxClick, m.sy - cyClick);
+    if (d <= m.r * slack && d < bestDist) { best = m; bestDist = d; }
+  }
+  if (best) openPopup(best.token);
+}
+
+/* ---------------- popup ---------------- */
+
+const popupOverlay = document.getElementById('popupOverlay');
+const popupVisual = document.getElementById('popupVisual');
+const popupName = document.getElementById('popupName');
+const popupCollection = document.getElementById('popupCollection');
+const popupId = document.getElementById('popupId');
+const popupOwner = document.getElementById('popupOwner');
+const popupCoords = document.getElementById('popupCoords');
+const popupTraits = document.getElementById('popupTraits');
+const popupCloseBtn = document.getElementById('popupCloseBtn');
+let popupToken = null;
+
+async function openPopup(token) {
+  popupToken = token;
+  popupVisual.innerHTML = '';
+  const meta = token.metadata;
+  popupName.textContent = token.name || (meta && meta.name) || ('Token #' + token.id);
+  const c = token.collection;
+  popupCollection.textContent = c ? (c.name || 'Collection') + (c.symbol ? ' (' + c.symbol + ')' : '') : '';
+  popupId.textContent = 'Token ID: ' + token.id;
+  popupOwner.textContent = token.owner;
+  popupCoords.textContent = token.coords ? token.coords.raw : 'No coordinates found';
+  const bits = [];
+  if (token.order !== null) bits.push('Order: ' + describeOrder(token.order));
+  if (token.use !== null) bits.push('Use: ' + describeUse(token.use));
+  popupTraits.textContent = bits.join('  |  ');
+  popupOverlay.style.display = 'flex';
+
+  if (meta) { popupVisual.appendChild(buildVisualNode(meta)); return; }
+
+  // Snapshot tokens carry no artwork: fetch this one token live (tokenURI + current owner).
+  popupVisual.textContent = 'Loading artwork…';
+  try {
+    await ensureLiveMetadata(token);
+    if (popupToken !== token) return;
+    popupVisual.innerHTML = '';
+    popupVisual.appendChild(buildVisualNode(token.metadata));
+    popupOwner.textContent = token.owner;
+    if (token.metadata.name) popupName.textContent = token.metadata.name;   // e.g. "Folly #1"; the snapshot only holds the place name
+  } catch (e) {
+    if (popupToken !== token) return;
+    popupVisual.textContent = 'Could not load the artwork right now (' + String(e.message || e).slice(0, 80) + ').';
+  }
+}
+
+// Click lookups ask config.rpcUrls in order: first your private proxy (which holds the Alchemy key
+// server-side), then free public Sepolia endpoints as a backup. Anything still containing
+// "YOUR-" is an unfilled placeholder and is skipped. Each attempt gives up after 12 seconds.
+const liveProviders = new Map();
+function liveProvider(url) {
+  if (!liveProviders.has(url)) {
+    const chainId = config && config.chainId;
+    const req = new ethers.FetchRequest(url);
+    req.timeout = 12000;
+    liveProviders.set(url, chainId
+      ? new ethers.JsonRpcProvider(req, chainId, { staticNetwork: ethers.Network.from(chainId), batchMaxCount: 1 })
+      : new ethers.JsonRpcProvider(req, undefined, { batchMaxCount: 1 }));
+  }
+  return liveProviders.get(url);
+}
+
+// Browser cache for click lookups, so re-opening the same token (or reloading the page) does not
+// call the network again. Entries expire after 30 minutes because ownership can change; the
+// newest 40 are kept so the browser's storage allowance is never an issue. Storage can be blocked
+// or full, so every access is wrapped and the page works the same without it.
+const META_CACHE_KEY = 'folliesGeosphere.meta.v1';
+const META_CACHE_TTL_MS = 30 * 60 * 1000;
+const META_CACHE_MAX = 40;
+function readMetaCache() {
+  try { return JSON.parse(localStorage.getItem(META_CACHE_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function writeMetaCache(cache) {
+  const keys = Object.keys(cache);
+  if (keys.length > META_CACHE_MAX) {
+    keys.sort((x, y) => cache[x].t - cache[y].t).slice(0, keys.length - META_CACHE_MAX).forEach(k => delete cache[k]);
+  }
+  try { localStorage.setItem(META_CACHE_KEY, JSON.stringify(cache)); }
+  catch (e) {
+    try { localStorage.removeItem(META_CACHE_KEY); } catch (e2) { /* ignore */ }
+  }
+}
+function cacheKeyFor(token) { return token.collection.address.toLowerCase() + ':' + token.id; }
+
+async function ensureLiveMetadata(token) {
+  if (token.metadata) return;
+  if (token.collection.sample) throw new Error('this is sample data, so there is no artwork');
+
+  const key = cacheKeyFor(token);
+  const cache = readMetaCache();
+  const hit = cache[key];
+  if (hit && Date.now() - hit.t < META_CACHE_TTL_MS && hit.m) {
+    token.metadata = hit.m;
+    if (hit.o) token.owner = hit.o;
+    return;
+  }
+
+  const urls = ((config && config.rpcUrls) || []).filter(u => u && !/YOUR-/i.test(u));
+  if (!urls.length) throw new Error('no RPC endpoints configured');
+  let lastErr;
+  for (const url of urls) {
+    try {
+      const contract = new ethers.Contract(token.collection.address, ERC721_ABI, liveProvider(url));
+      const [uri, owner] = await Promise.all([
+        contract.tokenURI(token.id),
+        contract.ownerOf(token.id).catch(() => null)   // a missing owner keeps the snapshot's value
+      ]);
+      token.metadata = decodeTokenURI(uri);
+      if (owner) token.owner = owner;
+      const fresh = readMetaCache();
+      fresh[key] = { t: Date.now(), m: token.metadata, o: token.owner };
+      writeMetaCache(fresh);
+      return;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('all RPC endpoints failed');
+}
+function closePopup() {
+  popupToken = null;
+  popupOverlay.style.display = 'none';
+  popupVisual.innerHTML = '';
+}
+popupCloseBtn.addEventListener('click', closePopup);
+popupOverlay.addEventListener('click', (e) => { if (e.target === popupOverlay) closePopup(); });
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePopup(); });
+
+/* ---------------- load / add flow ---------------- */
+
+async function mapChunked(items, size, fn) {
+  for (let i = 0; i < items.length; i += size) {
+    await Promise.all(items.slice(i, i + size).map(fn));
+  }
+}
+
+async function addCollection() {
+  clearLog();
+
+  const rpcUrl = document.getElementById('rpcUrl').value.trim();
+  const addressInput = document.getElementById('contractAddress');
+  const address = addressInput.value.trim();
+
+  if (!address) { log("Enter a contract address.", "err"); return; }
+  if (!ethers.isAddress(address)) {
+    log("That doesn't look like a contract address (expected 0x followed by 40 hex characters).", "err");
+    return;
+  }
+
+  // Same address on a different RPC is a different collection (fresh Anvil instances
+  // deploy to identical addresses), so the RPC is part of the identity.
+  const key = rpcUrl.toLowerCase() + '|' + address.toLowerCase();
+  if (collections.some(c => c.key === key)) {
+    log("That contract is already loaded from this RPC.", "err");
+    return;
+  }
+
+  loadBtn.disabled = true;
+  loadBtn.textContent = 'Loading…';
+  if (!tokens.length) { emptyStateEl.style.display = 'block'; emptyStateEl.textContent = 'Loading...'; }
+
+  try {
+    log("Connecting to " + rpcUrl + " ...");
+    const provider = new ethers.JsonRpcProvider(rpcUrl);
+    const network = await provider.getNetwork();
+    log("Connected. Chain ID: " + network.chainId, "ok");
+
+    const code = await provider.getCode(address);
+    if (!code || code === '0x') {
+      log("Not added: no contract at that address on this RPC (wrong address, or Anvil was restarted?).", "err");
+      return;
+    }
+
+    const contract = new ethers.Contract(address, ERC721_ABI, provider);
+
+    let name = "", symbol = "";
+    try { name = await contract.name(); } catch {}
+    try { symbol = await contract.symbol(); } catch {}
+
+    let tokenIds = [];
+    let usedEnumerable = false;
+    try {
+      const supply = await contract.totalSupply();
+      const n = Number(supply);
+      log("totalSupply() = " + n + " (using ERC721Enumerable)");
+      for (let i = 0; i < n; i++) {
+        const id = await contract.tokenByIndex(i);
+        tokenIds.push(id.toString());
+      }
+      usedEnumerable = true;
+    } catch (e) {
+      log("Enumerable calls failed (" + String(e.message).slice(0, 80) + "), falling back to Transfer log scan...", "warn");
+      tokenIds = await discoverTokenIdsViaLogs(provider, address);
+      log("Found " + tokenIds.length + " token id(s) via logs.");
+    }
+
+    if (tokenIds.length === 0) {
+      log("Not added: no tokens found (nothing minted yet, or this isn't an ERC-721 contract).", "err");
+      return;
+    }
+
+    const collection = {
+      key, address, rpcUrl, name, symbol,
+      color: nextCollectionColor(),
+      tokens: [], plotted: 0, skipped: 0, failed: 0
+    };
+    const failureNotes = [];
+
+    await mapChunked(tokenIds, 8, async (idStr) => {
+      try {
+        const owner = await contract.ownerOf(idStr);
+        const uri = await contract.tokenURI(idStr);
+        const metadata = decodeTokenURI(uri);
+        const coords = parseEquatorialCoordinates(metadata);
+        if (!coords) { collection.skipped++; return; }
+        collection.tokens.push(makeToken({
+          id: idStr,
+          owner,
+          metadata,
+          name: metadata.name,
+          coords,
+          order: parseOrderTrait(getTraitValue(metadata, 'Order')),
+          use: parseUseTrait(getTraitValue(metadata, 'Use')),
+          collection
+        }));
+        collection.plotted++;
+      } catch (e) {
+        collection.failed++;
+        failureNotes.push("Token #" + idStr + " failed: " + String(e.message).slice(0, 90));
+      }
+    });
+
+    if (collection.plotted === 0) {
+      const why = [];
+      if (collection.skipped) why.push(collection.skipped + " without an Equatorial Coordinates trait");
+      if (collection.failed) why.push(collection.failed + " failed to load");
+      log("Not added: none of the " + tokenIds.length + " token(s) could be plotted (" + why.join(", ") + ").", "err");
+      failureNotes.slice(0, 3).forEach(n => log(n, "err"));
+      return;
+    }
+
+    collection.tokens.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    collections.push(collection);
+    if (collections.length === 1) centerOnTokens(collection.tokens);   // first collection: face its tokens
+    rebuildTokens();
+
+    failureNotes.slice(0, 3).forEach(n => log(n, "err"));
+    if (failureNotes.length > 3) log("...and " + (failureNotes.length - 3) + " more failed.", "err");
+    if (collection.skipped) log(collection.skipped + " token(s) skipped: no Equatorial Coordinates trait.", "warn");
+
+    log("Added " + (name || "collection") + ": " + collection.plotted + " plotted" +
+        (usedEnumerable ? "" : " [via log scan]"), "ok");
+
+    addressInput.value = '';   // ready for the next contract
+    if (walletFilter) applyWalletFilter();   // keep an active filter's note/counts current
+    renderLegend();
+    refreshEmptyState();
+    draw();
+    scheduleLogHide();
+  } catch (e) {
+    log("Error: " + e.message, "err");
+    if (e.message && e.message.includes("could not detect network")) {
+      log("Is Anvil running and listening on that RPC URL? Also check for CORS errors in the browser console.", "err");
+    }
+  } finally {
+    loadBtn.disabled = false;
+    updateButtonLabel();
+    refreshEmptyState();
+  }
+}
+
+loadBtn.addEventListener('click', addCollection);
+
+/* ---------------- public mode: preloaded snapshot ---------------- */
+
+// config.json (next to this page) lists the Follies contract(s) and where the snapshot file is.
+// If it is missing or unreadable - for example when this file is opened straight from disk -
+// the page falls back to the live-RPC loader used for local Anvil testing. Add ?dev to the
+// address to force that loader.
+let config = null;
+
+function parseRa(str) {
+  const m = /^(\d+):(\d+):(\d+)$/.exec(str);
+  if (!m) return null;
+  return ((parseInt(m[1], 10) + parseInt(m[2], 10) / 60 + parseInt(m[3], 10) / 3600) / 24) * 360;
+}
+
+// Snapshot token row: [id, ownerIndex, "HH:MM:SS", dec, order(-1 = Unordered, null = none), use, name]
+function tokenFromSnapshot(row, owners, collection) {
+  const raDeg = parseRa(row[2]);
+  if (raDeg === null) return null;
+  const dec = Number(row[3]);
+  return makeToken({
+    id: String(row[0]),
+    owner: owners[row[1]] || '',
+    name: row[6] || '',
+    coords: { raDeg, decDeg: dec, raw: 'α=' + row[2] + '; δ=' + dec },
+    order: row[4] === null || row[4] === undefined ? null : (row[4] === -1 ? 'U' : row[4]),
+    use: row[5] === null || row[5] === undefined ? null : row[5],
+    collection
+  });
+}
+
+function timeAgo(iso) {
+  const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (!isFinite(secs)) return '';
+  if (secs < 90) return 'just now';
+  if (secs < 5400) return Math.round(secs / 60) + ' min ago';
+  if (secs < 129600) return Math.round(secs / 3600) + ' h ago';
+  return Math.round(secs / 86400) + ' days ago';
+}
+
+async function loadSnapshot() {
+  emptyIdleText = 'Loading the Follies…';
+  refreshEmptyState();
+  try {
+    const res = await fetch(config.snapshotUrl, { cache: 'no-cache' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const snap = await res.json();
+
+    for (const sc of snap.collections || []) {
+      const cfgEntry = (config.collections || []).find(c => c.address.toLowerCase() === String(sc.address).toLowerCase()) || {};
+      const collection = {
+        key: 'snapshot|' + String(sc.address).toLowerCase(),
+        address: sc.address,
+        rpcUrl: '',
+        sourceLabel: 'snapshot',
+        name: cfgEntry.name || sc.name || '',
+        symbol: sc.symbol || '',
+        color: cfgEntry.color || nextCollectionColor(),
+        sample: !!snap.sample,
+        tokens: [], plotted: 0, skipped: sc.skipped || 0, failed: 0
+      };
+      for (const row of sc.tokens || []) {
+        const t = tokenFromSnapshot(row, sc.owners || [], collection);
+        if (t) collection.tokens.push(t); else collection.skipped++;
+      }
+      collection.plotted = collection.tokens.length;
+      if (collection.plotted === 0) continue;
+      collections.push(collection);
+    }
+    centerOnTokens(collections.flatMap(c => c.tokens));
+
+    emptyIdleText = collections.length ? 'Load a collection to plot it.' : 'The snapshot has no plottable tokens yet.';
+    rebuildTokens();
+    renderLegend();
+    refreshEmptyState();
+    if (snap.sample) {
+      snapNoteEl.textContent = 'TEST DATA: invented tokens, not the real collection';
+      snapNoteEl.classList.add('is-test');
+    } else if (snap.generatedAt) {
+      snapNoteEl.textContent = 'Snapshot updated ' + timeAgo(snap.generatedAt) +
+        (snap.collections && snap.collections[0] && snap.collections[0].lastBlock ? ' · block ' + snap.collections[0].lastBlock : '');
+    }
+    draw();
+  } catch (e) {
+    emptyIdleText = 'Could not load the snapshot (' + config.snapshotUrl + '): ' + String(e.message || e);
+    refreshEmptyState();
+  }
+}
+
+async function initApp() {
+  const params = new URLSearchParams(location.search);
+  const wantDev = params.has('dev');
+  const onThisComputer = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+  let usable = false;
+  if (!wantDev && location.protocol !== 'file:') {   // fetch() can't read local files, so opening from disk uses the live loader
+    // On your own computer a config.local.json (if you made one) is used instead of config.json,
+    // so local tests never need edits to the file that gets published. It is never requested from a real site.
+    const names = onThisComputer ? ['config.local.json', 'config.json'] : ['config.json'];
+    for (const name of names) {
+      try {
+        const res = await fetch(name, { cache: 'no-cache' });
+        if (!res.ok) continue;
+        const cfg = await res.json();
+        if (cfg && Array.isArray(cfg.collections) && cfg.collections.length && cfg.snapshotUrl) { config = cfg; usable = true; break; }
+      } catch (e) { /* try the next one; with none usable, the live-RPC loader runs */ }
+    }
+    // ?snapshot=data/snapshot.sample.json loads a different file from this site's own data folder (for testing).
+    const override = params.get('snapshot');
+    if (usable && override && /^data\/[A-Za-z0-9._-]+\.json$/.test(override)) config.snapshotUrl = override;
+  }
+  document.body.classList.remove('booting');
+  if (usable) {
+    document.body.classList.add('public-mode');
+    document.getElementById('subtitle').textContent =
+      config.subtitle || 'Every Folly, plotted by its on-chain Equatorial Coordinates onto a rotatable globe.';
+    await loadSnapshot();
+  }
+}
+
+// Size everything and paint the empty globe, rings and stars right away.
+resizeCanvas();
+initApp();
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "chainId": 11155111,
+  "snapshotUrl": "data/snapshot.json",
+  "rpcUrls": [
+    "https://YOUR-LAMBDA-URL.lambda-url.us-east-1.on.aws/",
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https://sepolia.drpc.org"
+  ],
+  "collections": [
+    {
+      "name": "Loot Follies",
+      "address": "0x91977DC9D1d6B57FE97C3D2dAF9db3b1D5381597",
+      "color": "#e0b04a"
+    },
+    {
+      "name": "Loot Ascendant Follies",
+      "address": "0x5B79b23832A551f76F132d4ed30A690b6d877180",
+      "color": "#b58cff"
+    }
+  ]
+}

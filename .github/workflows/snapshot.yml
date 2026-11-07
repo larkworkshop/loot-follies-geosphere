@@ -1,0 +1,77 @@
+name: Refresh Follies snapshot
+
+# Reads the contracts listed in config.json on a schedule and, only if something changed,
+# commits data/snapshot.json. AWS Amplify watches this repo and redeploys the site on that commit.
+#
+# The Alchemy KEY (just the key, not the whole address) lives in the repository secret ALCHEMY_KEY.
+# Only the "Read the chain" step receives it. Do not turn on debug logging for this workflow, and do not
+# add steps that print environment variables.
+
+on:
+  schedule:
+    # HOW OFTEN IT RUNS. Starts at every 15 minutes for the first week or so.
+    # To switch to hourly later, replace the line below with:   - cron: "17 * * * *"
+    - cron: "*/15 * * * *"     # GitHub may start scheduled runs a few minutes late
+  push:
+    branches: [main]
+    paths:                     # re-read the chain when the contract list or the reader script changes
+      - "config.json"
+      - "scripts/**"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Rescan every token instead of only new activity"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write              # lets the job commit data/snapshot.json
+
+concurrency:
+  group: follies-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350       # the very first scan of ~11,600 tokens takes a while; later runs take about a minute
+    env:
+      AMPLIFY_WEBHOOK_URL: ${{ secrets.AMPLIFY_WEBHOOK_URL }}   # empty unless you add that secret (optional)
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 20
+      # Installs exactly what package-lock.json says, and runs none of the packages' install scripts.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Read the chain and write data/snapshot.json
+        env:
+          ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
+          FULL_REFRESH: ${{ inputs.full_refresh && '1' || '0' }}
+        run: node scripts/snapshot.mjs
+
+      - name: Commit the snapshot if it changed
+        id: commit
+        run: |
+          if [ -n "$(git status --porcelain data/snapshot.json)" ]; then
+            git config user.name "follies-snapshot-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add data/snapshot.json
+            git commit -m "Update Follies snapshot"
+            git pull --rebase --autostash
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Snapshot unchanged - nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # OPTIONAL. Only does anything if you add the secret AMPLIFY_WEBHOOK_URL (see README, step 3).
+      # Needed only if Amplify turns out not to rebuild by itself when this job pushes a commit.
+      - name: Ask Amplify to rebuild (only if the webhook secret is set)
+        if: steps.commit.outputs.changed == 'true' && env.AMPLIFY_WEBHOOK_URL != ''
+        run: |
+          curl -sS -X POST -d '{}' -H "Content-Type: application/json" "$AMPLIFY_WEBHOOK_URL"

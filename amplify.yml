@@ -1,0 +1,15 @@
+version: 1
+frontend:
+  phases:
+    build:
+      commands:
+        # Nothing to compile. Copy only the public site files so scripts, the proxy code and
+        # node packages are not published.
+        - mkdir -p _site
+        - cp index.html globe-viewer.css config.json _site/
+        - cp -r data _site/data
+        - rm -f _site/data/snapshot.sample.json
+  artifacts:
+    baseDirectory: _site
+    files:
+      - '**/*'
