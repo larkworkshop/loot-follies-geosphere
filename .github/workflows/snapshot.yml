@@ -40,8 +40,8 @@ jobs:
     env:
       AMPLIFY_WEBHOOK_URL: ${{ secrets.AMPLIFY_WEBHOOK_URL }}   # empty unless you add that secret (optional)
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v4.4.0
         with:
           node-version: 20
       # Installs exactly what package-lock.json says, and runs none of the packages' install scripts.

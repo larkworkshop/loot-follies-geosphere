@@ -44,8 +44,8 @@
       <div class="filter-note" id="filterNote"></div>
     </div>
 
-    <details class="adv-filters" id="advFilters">
-      <summary>Order &amp; Use filters <span class="adv-badge" id="advBadge"></span></summary>
+    <div class="adv-filters" id="advFilters">
+      <div class="adv-title">Order &amp; Use filters <span class="adv-badge" id="advBadge"></span></div>
       <div class="fgroup">
         <div class="fgroup-head"><span>Use</span><span class="fbtns"><button type="button" data-set="use" data-mode="all">All</button><button type="button" data-set="use" data-mode="none">None</button></span></div>
         <div class="checks" id="useChecks"></div>
@@ -54,7 +54,10 @@
         <div class="fgroup-head"><span>Order</span><span class="fbtns"><button type="button" data-set="order" data-mode="all">All</button><button type="button" data-set="order" data-mode="none">None</button></span></div>
         <div class="checks two-col" id="orderChecks"></div>
       </div>
-    </details>
+      <div class="fgroup">
+        <div class="fgroup-head"><span>Folly numbers</span><span class="fbtns"><button type="button" id="numbersToggle" aria-pressed="true" title="Show or hide the #1234 numbers next to dots">Turn off</button></span></div>
+      </div>
+    </div>
     <div class="shown-count" id="shownCount"></div>
 
     <h3 class="legend-title">Collections<span class="filter-badge" id="filterBadge"></span></h3>
@@ -66,6 +69,10 @@
 <div class="globe-stage" id="globeStage">
   <canvas id="globeCanvas"></canvas>
   <div class="empty-state" id="emptyState">Load a collection to plot it.</div>
+  <div class="zoom-gauge" id="zoomGauge" role="img" aria-label="Zoom level"></div>
+  <div id="zoomReadout"></div>
+  <div id="cursorReadout"></div>
+  <div class="zoom-hint" id="zoomHint">Zoom in to see individual Follies</div>
 </div>
 
 <div class="bottom-bar">
@@ -110,6 +117,15 @@ const filterBadge = document.getElementById('filterBadge');
 const shownCountEl = document.getElementById('shownCount');
 const advBadge = document.getElementById('advBadge');
 const advFilters = document.getElementById('advFilters');
+let showNumbers = true;               // the "Folly numbers" button in the filters turns the #1234 labels off and on
+const numbersToggle = document.getElementById('numbersToggle');
+numbersToggle.addEventListener('click', () => {
+  showNumbers = !showNumbers;
+  numbersToggle.textContent = showNumbers ? 'Turn off' : 'Turn on';
+  numbersToggle.setAttribute('aria-pressed', String(showNumbers));
+  numbersToggle.classList.toggle('is-off', !showNumbers);
+  draw();
+});
 const snapNoteEl = document.getElementById('snapNote');
 
 // The log stays hidden until something is loading or fails. After a clean load it
@@ -322,7 +338,7 @@ function parseUseTrait(v) {
   return n <= 23 ? n : null;
 }
 function useGroupOf(use) { return use === null || use === undefined ? null : Math.floor(use / 4); }
-function describeOrder(o) { return o === null || o === undefined ? '' : (o === 'U' ? 'Unordered' : o + ' · ' + ORDER_NAMES[o]); }
+function describeOrder(o) { return o === null || o === undefined ? '' : (o === 'U' ? 'Unordered' : ORDER_NAMES[o]); }
 function describeUse(u) { return u === null || u === undefined ? '' : USE_GROUPS[useGroupOf(u)].label + ' (' + u + ')'; }
 
 function makeToken(f) {
@@ -523,7 +539,7 @@ function makeCheck(kind, key, text, hint) {
   const useBox = document.getElementById('useChecks');
   USE_GROUPS.forEach((g, i) => useBox.appendChild(makeCheck('use', i, g.label, g.lo + '–' + g.hi)));
   const orderBox = document.getElementById('orderChecks');
-  ORDER_KEYS.forEach(k => orderBox.appendChild(makeCheck('order', k, k === 'U' ? 'Unordered' : k + ' · ' + ORDER_NAMES[k])));
+  ORDER_KEYS.forEach(k => orderBox.appendChild(makeCheck('order', k, k === 'U' ? 'Unordered' : ORDER_NAMES[k])));
 })();
 
 advFilters.addEventListener('change', (e) => {
@@ -789,6 +805,10 @@ const stackedQuery = window.matchMedia('(max-width: 900px)');
 
 let markerHitTargets = [];    // recomputed each draw: { token, sx, sy, r }
 // Opens with the equator running flat across the middle and RA 0h facing you. yaw = -90deg - longitude puts that longitude at the centre of the disc.
+const DRAG_RADIANS_PER_PX = 0.006;        // how far a drag turns the globe at normal zoom (it is divided by the zoom when zoomed in)
+const MIN_ZOOM = 0.4, MAX_ZOOM = 10;      // how far out and in you can go
+const MAX_ZOOM_PHONE = 15;                // phone-sized layouts (900 px wide or less) can zoom further
+function maxZoom() { return stackedQuery.matches ? MAX_ZOOM_PHONE : MAX_ZOOM; }
 const view = { yaw: -Math.PI / 2, pitch: 0, zoom: 1 };
 function faceLongitude(deg) { view.yaw = -Math.PI / 2 - deg * Math.PI / 180; }
 // Turn the globe (left/right only) so the middle of a set of tokens faces you.
@@ -805,6 +825,7 @@ let dpr = window.devicePixelRatio || 1;
 
 function resizeCanvas() {
   dpr = window.devicePixelRatio || 1;
+  view.zoom = clampZoom(view.zoom);       // e.g. a phone-sized window stretched to desktop size while zoomed past 10x
   const rect = stage.getBoundingClientRect();
   const w = Math.max(1, Math.round(rect.width * dpr));
   const h = Math.max(1, Math.round(rect.height * dpr));
@@ -827,33 +848,121 @@ function rotatePoint(p, yaw, pitch) {
   return { x, y: y2, z: z2 };
 }
 
+/* ---- grid: 30 degree lines always; 15 and then 5 degree lines fade in as you zoom (never finer than 5) ----
+   Labels ride along the grid line nearest the middle of the screen: right ascension in hours along that
+   parallel, declination in degrees along that meridian. */
+const GRID_LEVELS = [
+  { step: 30, fadeFrom: 0,  fadeTo: 0,   alpha: 0.18 },
+  { step: 15, fadeFrom: 80, fadeTo: 115, alpha: 0.14 },   // fadeFrom/To: on-screen gap between lines, in pixels
+  { step: 5,  fadeFrom: 55, fadeTo: 85,  alpha: 0.11 }
+];
+function gridFades(R) {
+  return GRID_LEVELS.map(L => {
+    if (L.fadeTo === 0) return 1;
+    const px = (R / dpr) * L.step * Math.PI / 180;
+    return smoothstep((px - L.fadeFrom) / (L.fadeTo - L.fadeFrom));
+  });
+}
+// The grid level a line belongs to is the coarsest one it falls on (so 30 is never drawn twice).
+function gridLevelOf(v) { for (let i = 0; i < GRID_LEVELS.length; i++) if (v % GRID_LEVELS[i].step === 0) return i; return GRID_LEVELS.length - 1; }
+
+function formatRA(raDeg) {
+  const totalMin = Math.round((((raDeg % 360) + 360) % 360) / 15 * 60) % (24 * 60);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  return m === 0 ? h + 'h' : h + 'h' + String(m).padStart(2, '0') + 'm';
+}
+function formatDec(d) { return d > 0 ? '+' + d + '°' : d < 0 ? '−' + Math.abs(d) + '°' : '0°'; }
+
+// Where the middle of the screen is looking, as RA and Dec in degrees.
+function viewCentre(yaw, pitch) {
+  const ux = -Math.cos(pitch) * Math.sin(yaw), uy = Math.sin(pitch), uz = Math.cos(pitch) * Math.cos(yaw);
+  return { ra: ((Math.atan2(-uz, ux) * 180 / Math.PI) % 360 + 360) % 360, dec: Math.asin(Math.max(-1, Math.min(1, uy))) * 180 / Math.PI };
+}
+
 function drawGraticule(cx, cy, R, yaw, pitch) {
-  ctx.strokeStyle = 'rgba(223, 217, 181, 0.09)';
+  const fades = gridFades(R);
   ctx.lineWidth = 1;
 
-  for (let dec = -60; dec <= 60; dec += 30) {
+  // lines, one batch per level
+  for (let li = 0; li < GRID_LEVELS.length; li++) {
+    if (fades[li] < 0.02) continue;
+    ctx.strokeStyle = 'rgba(223, 217, 181, ' + (GRID_LEVELS[li].alpha * fades[li]) + ')';
     ctx.beginPath();
-    let started = false;
-    for (let ra = 0; ra <= 360; ra += 4) {
-      const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
-      if (r.z <= 0) { started = false; continue; }
-      const sx = cx + r.x * R, sy = cy - r.y * R;
-      if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
+    for (let dec = -85; dec <= 85; dec += 5) {
+      if (gridLevelOf(dec) !== li) continue;
+      let started = false;
+      for (let ra = 0; ra <= 360; ra += 4) {
+        const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
+        if (r.z <= 0) { started = false; continue; }
+        const sx = cx + r.x * R, sy = cy - r.y * R;
+        if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
+      }
+    }
+    for (let ra = 0; ra < 360; ra += 5) {
+      if (gridLevelOf(ra) !== li) continue;
+      let started = false;
+      for (let dec = -90; dec <= 90; dec += 4) {
+        const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
+        if (r.z <= 0) { started = false; continue; }
+        const sx = cx + r.x * R, sy = cy - r.y * R;
+        if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
+      }
     }
     ctx.stroke();
   }
 
-  for (let ra = 0; ra < 360; ra += 30) {
-    ctx.beginPath();
-    let started = false;
-    for (let dec = -90; dec <= 90; dec += 4) {
-      const r = rotatePoint(toUnitVector(ra, dec), yaw, pitch);
-      if (r.z <= 0) { started = false; continue; }
-      const sx = cx + r.x * R, sy = cy - r.y * R;
-      if (!started) { ctx.moveTo(sx, sy); started = true; } else ctx.lineTo(sx, sy);
-    }
-    ctx.stroke();
+  // labels along the grid line nearest the middle of the screen, using the finest level that is clearly visible
+  let fine = 0;
+  for (let li = 0; li < GRID_LEVELS.length; li++) if (fades[li] > 0.5) fine = li;
+  const step = GRID_LEVELS[fine].step, centre = viewCentre(yaw, pitch);
+  const rowDec = Math.max(-85, Math.min(85, Math.round(centre.dec / step) * step));
+  const colRA = (Math.round(centre.ra / step) * step) % 360;
+  ctx.font = (12 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+  const textRGB = '236, 220, 176';
+  const margin = 24 * dpr, minGap = 46 * dpr;
+
+  // right ascension: just below the row line, thinned so labels never pile up
+  const ras = [];
+  for (let ra = 0; ra < 360; ra += 5) {
+    const li = gridLevelOf(ra);
+    if (fades[li] < 0.05) continue;
+    const r = rotatePoint(toUnitVector(ra, rowDec), yaw, pitch);
+    if (r.z < 0.3) continue;
+    const sx = cx + r.x * R, sy = cy - r.y * R;
+    if (!inViewWin(sx, sy, margin)) continue;
+    ras.push({ ra, sx, sy, li });
   }
+  ras.sort((p, q) => p.sx - q.sx);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  let lastX = -1e9;
+  for (const p of ras) {
+    if (p.sx - lastX < minGap) continue;
+    lastX = p.sx;
+    ctx.fillStyle = 'rgba(' + textRGB + ', ' + (0.75 * fades[p.li]) + ')';
+    ctx.fillText(formatRA(p.ra), p.sx, p.sy + 5 * dpr);
+  }
+
+  // declination: just right of the column line
+  const decs = [];
+  for (let dec = -85; dec <= 85; dec += 5) {
+    const li = gridLevelOf(dec);
+    if (fades[li] < 0.05) continue;
+    const r = rotatePoint(toUnitVector(colRA, dec), yaw, pitch);
+    if (r.z < 0.3) continue;
+    const sx = cx + r.x * R, sy = cy - r.y * R;
+    if (!inViewWin(sx, sy, margin)) continue;
+    decs.push({ dec, sx, sy, li });
+  }
+  decs.sort((p, q) => p.sy - q.sy);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  let lastY = -1e9;
+  for (const p of decs) {
+    if (p.sy - lastY < minGap * 0.6) continue;
+    lastY = p.sy;
+    ctx.fillStyle = 'rgba(' + textRGB + ', ' + (0.75 * fades[p.li]) + ')';
+    ctx.fillText(formatDec(p.dec), p.sx + 6 * dpr, p.sy - 3 * dpr);
+  }
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 }
 
 // Thin, bright eclipse ring hugging the globe's edge.
@@ -873,6 +982,245 @@ function drawEclipseRing(cx, cy, R) {
   ctx.restore();
 }
 
+/* ---------------- marker look: tuning values ---------------- */
+
+// Dot radius (screen pixels) at the default zoom, by how many tokens are showing. Dots then shrink as
+// you zoom in, down to MIN_DOT_PX, so crowded areas separate instead of merging.
+function dotBasePx(n) { return n > 3000 ? 1.5 : n > 1000 ? 2.0 : n > 300 ? 2.6 : 3.4; }
+const MIN_DOT_PX = 1.0;
+// Dots grow back as you go deep: 1x up to normal zoom, rising smoothly to DOT_MAX_BOOST x at full zoom.
+const DOT_MAX_BOOST = 2;
+function zoomDotBoost(zoom) {
+  if (zoom <= 1) return 1;
+  return 1 + (DOT_MAX_BOOST - 1) * Math.min(1, Math.log(zoom) / Math.log(maxZoom()));
+}
+function zoomDotScale(zoom) { return zoom >= 1 ? Math.pow(zoom, -0.6) : Math.pow(zoom, 0.5); }
+
+/* ---- frame: once the globe has grown bigger than the window, the view is framed like a window onto it ----
+   The picture is clipped to a rounded window that slides in from the screen edges, with a soft dark vignette
+   inside and a thin border, so deep zoom no longer reads as "the whole screen is the globe". */
+const FRAME_INSET = 16;               // gap between the window and the screen edge, in screen pixels
+const FRAME_RADIUS = 14;
+const FRAME_VIGNETTE = 0.35;          // extra darkening toward the corners of the window (0 = none)
+const FRAME_FADE = 190;               // how far in from each edge the picture fades to dark, in screen pixels
+const FRAME_FADE_DARK = 0.95;         // how dark it is right at the edge (1 = fully dark)
+let viewWin = { x0: 0, y0: 0, x1: 0, y1: 0 };   // the part of the canvas that is shown, in canvas pixels (set each draw)
+function frameStrength(cx, cy, R, w, h) {
+  const reach = Math.hypot(Math.max(cx, w - cx), Math.max(cy, h - cy));   // distance to the farthest corner
+  const start = Math.min(w, h) * 0.5;                                      // the globe's edge reaches the window edge
+  return smoothstep((R - start) / Math.max(1, reach - start));
+}
+function frameRectPath(win, radius) {
+  ctx.beginPath();
+  const x = win.x0, y = win.y0, rw = win.x1 - win.x0, rh = win.y1 - win.y0, r = Math.max(0, Math.min(radius, rw / 2, rh / 2));
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + rw, y, x + rw, y + rh, r);
+  ctx.arcTo(x + rw, y + rh, x, y + rh, r);
+  ctx.arcTo(x, y + rh, x, y, r);
+  ctx.arcTo(x, y, x + rw, y, r);
+  ctx.closePath();
+}
+function inViewWin(sx, sy, margin) { return sx >= viewWin.x0 + margin && sx <= viewWin.x1 - margin && sy >= viewWin.y0 + margin && sy <= viewWin.y1 - margin; }
+
+// Edge fade: z is 1 for a dot facing you and 0 at the rim. Dots nearer the rim are drawn smaller and dimmer.
+const EDGE_BANDS = [
+  { below: 0.12, size: 0.45, alpha: 0.30 },
+  { below: 0.30, size: 0.65, alpha: 0.50 },
+  { below: 0.55, size: 0.85, alpha: 0.78 },
+  { below: Infinity, size: 1.00, alpha: 1.00 }
+];
+function edgeBand(z) { for (let i = 0; i < EDGE_BANDS.length; i++) if (z < EDGE_BANDS[i].below) return i; return EDGE_BANDS.length - 1; }
+
+// Glow vs dots is decided by the average gap (screen pixels) between neighbouring dots. At or below
+// GLOW_ONLY_GAP you see just the glow; at or above DOTS_ONLY_GAP you see just dots; in between they
+// cross-fade. The gap grows as you zoom in or filter tokens away, so those bring the dots back.
+const GLOW_ONLY_GAP = 7;
+const DOTS_ONLY_GAP = 14;
+// Folly numbers show while fewer than LABEL_BELOW_COUNT Follies are on screen (any zoom), or, once zoomed
+// to LABEL_DEEP_ZOOM or more, while no more than LABEL_DEEP_COUNT are on screen.
+const LABEL_BELOW_COUNT = 100;
+const LABEL_DEEP_ZOOM = 5;
+const LABEL_DEEP_COUNT = 400;
+// On a phone-sized layout (900 px wide or less) the screen is much smaller: numbers show only while fewer than
+// LABEL_BELOW_COUNT_PHONE Follies are on screen, at any zoom (the deeper-zoom allowance above is not used).
+const LABEL_BELOW_COUNT_PHONE = 60;
+const CLICKABLE_DOT_WEIGHT = 0.35;   // dots can be clicked once they are at least this visible
+const GLOW_CELL_CSS = 1;             // the lights are painted on a grid of 1 screen pixel, so each one stays a sharp point
+const GLOW_CORE = 1.0;               // brightness of a light's bright centre (before packed areas add up)
+const GLOW_CORE_PX = 0.85;           // how small the bright centre is, in screen pixels
+const GLOW_HALO = 0.20;              // brightness of the faint halo around each light
+const GLOW_HALO_PX = 2.6;            // how far the halo reaches, in screen pixels
+const GLOW_SOFT = 1.5;               // higher = packed areas reach full brightness sooner
+const GLOW_WHITE = 0.65;             // how far packed areas burn toward white (0 = stay in the contract colour)
+
+function smoothstep(t) { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); }
+
+const zoomHintEl = document.getElementById('zoomHint');
+
+/* ---- zoom gauge: a thin bar at the left edge, centred between the subtitle and the footer. 16 px tall fully
+   zoomed out, growing up and down together until it fills that space fully zoomed in. ---- */
+const zoomGaugeEl = document.getElementById('zoomGauge');
+const zoomReadoutEl = document.getElementById('zoomReadout');
+const cursorReadoutEl = document.getElementById('cursorReadout');
+Object.assign(zoomReadoutEl.style, { position: 'absolute', left: '26px', font: '13px/18px ui-monospace, SFMono-Regular, Menlo, monospace',
+  color: '#ecdcb0', textShadow: '1px 1px 3px rgba(0,0,0,0.9)', pointerEvents: 'none', zIndex: '3' });
+Object.assign(cursorReadoutEl.style, { position: 'absolute', right: '28px', bottom: '52px', font: '13px/18px ui-monospace, SFMono-Regular, Menlo, monospace',
+  color: '#ecdcb0', textShadow: '1px 1px 3px rgba(0,0,0,0.9)', pointerEvents: 'none', zIndex: '3', textAlign: 'right' });
+const GAUGE_MIN_PX = 16, GAUGE_GAP = 12, GAUGE_W = 8, READOUT_GAP = 10;
+// The look is set here as well as in the stylesheet, so the bar still shows if an old stylesheet is cached.
+Object.assign(zoomGaugeEl.style, { position: 'absolute', left: '28px', width: GAUGE_W + 'px', borderRadius: '4px',
+  background: '#ecdcb0', opacity: '0.8', pointerEvents: 'none', zIndex: '3' });
+function updateZoomGauge() {
+  const stageBox = stage.getBoundingClientRect();
+  // The bar's left edge lines up with the left edge of the title text (28 px on desktop, 20 px when stacked).
+  const titleEl = document.querySelector('.title-block h1');
+  const left = titleEl ? titleEl.getBoundingClientRect().left - stageBox.left : 28;
+  zoomGaugeEl.style.left = left + 'px';
+  zoomReadoutEl.style.left = (left + GAUGE_W + READOUT_GAP) + 'px';
+  let top, bottom;
+  if (stackedQuery.matches) { top = GAUGE_GAP; bottom = stageBox.height - GAUGE_GAP; }
+  else {
+    const sub = document.querySelector('.title-block .subtitle'), bar = document.querySelector('.bottom-bar');
+    top = (sub ? sub.getBoundingClientRect().bottom : 120) + GAUGE_GAP - stageBox.top;
+    bottom = (bar ? bar.getBoundingClientRect().top : stageBox.height) - GAUGE_GAP - stageBox.top;
+  }
+  const full = Math.max(GAUGE_MIN_PX, bottom - top);
+  const t = Math.max(0, Math.min(1, Math.log(view.zoom / MIN_ZOOM) / Math.log(maxZoom() / MIN_ZOOM)));
+  const height = GAUGE_MIN_PX + t * (full - GAUGE_MIN_PX), mid = (top + bottom) / 2;
+  zoomGaugeEl.style.top = (mid - height / 2) + 'px';          // grows and shrinks around the middle
+  zoomGaugeEl.style.height = height + 'px';
+  zoomGaugeEl.setAttribute('aria-label', 'Zoom level ' + Math.round(t * 100) + ' percent');
+  // the number beside the bar
+  zoomReadoutEl.style.top = (mid - 9) + 'px';
+  const zt = (view.zoom >= 9.95 ? String(Math.round(view.zoom)) : view.zoom.toFixed(1)) + '\u00d7';
+  if (zoomReadoutEl.textContent !== zt) zoomReadoutEl.textContent = zt;
+}
+
+/* ---- city lights ----
+   Zoomed out, every token is a tiny point of light with a faint halo, in its contract's colour. Lights add up
+   where they are packed, so busy regions burn bright and toward white while empty space stays dark, like the
+   night side of the Earth from orbit. Each token is stamped into a pixel grid (one grid per contract colour),
+   so the cost depends on the picture size and barely on the token count. */
+const glowCanvas = document.createElement('canvas');
+const gctx = glowCanvas.getContext('2d');
+const glowGrids = new Map();        // colour -> { a: Float32Array, rgb: [r, g, b], used: boolean }
+let glowImage = null;
+const GLOW_LUT = new Float32Array(1025);
+for (let i = 0; i < GLOW_LUT.length; i++) GLOW_LUT[i] = 1 - Math.exp(-GLOW_SOFT * i / 256);
+
+function parseColor(color) {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(color).trim());
+  if (!m) return [255, 255, 255];
+  const hex = m[1].length === 3 ? m[1].split('').map(c => c + c).join('') : m[1];
+  return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+}
+
+// Brightness of one light at squared distance d2 (in grid cells) from its centre: a sharp core plus a faint halo.
+const STAMP_R = 4, STAMP_STEPS = 64;
+const STAMP_LUT = new Float32Array(STAMP_R * STAMP_R * STAMP_STEPS + 2);
+function buildStamp(cellPx) {
+  const c2 = 2 * Math.pow(GLOW_CORE_PX / cellPx, 2), h2 = 2 * Math.pow(GLOW_HALO_PX / cellPx, 2);
+  for (let i = 0; i < STAMP_LUT.length; i++) {
+    const d2 = i / STAMP_STEPS;
+    STAMP_LUT[i] = GLOW_CORE * Math.exp(-d2 / c2) + GLOW_HALO * Math.exp(-d2 / h2);
+  }
+}
+
+// Each light is weighted by how squarely it faces you, so the squashed rim does not burn brighter than the middle.
+function drawDensityGlow(visible, cx, cy, R, w, h, discArea, weight) {
+  const cell = GLOW_CELL_CSS * dpr;
+  // Only the part of the screen the globe covers needs painting.
+  const ox = Math.max(0, Math.floor(cx - R)), oy = Math.max(0, Math.floor(cy - R));
+  const bw = Math.min(w, Math.ceil(cx + R)) - ox, bh = Math.min(h, Math.ceil(cy + R)) - oy;
+  if (bw < 2 || bh < 2) return;
+  const gw = Math.max(4, Math.ceil(bw / cell)), gh = Math.max(4, Math.ceil(bh / cell));
+  const size = gw * gh;
+  if (glowCanvas.width !== gw || glowCanvas.height !== gh) { glowCanvas.width = gw; glowCanvas.height = gh; glowImage = null; }
+  if (buildStamp.cell !== cell) { buildStamp(GLOW_CELL_CSS); buildStamp.cell = cell; }
+  for (const g of glowGrids.values()) { if (g.a.length !== size) g.a = new Float32Array(size); else g.a.fill(0); g.used = false; }
+
+  const maxD2 = STAMP_R * STAMP_R;
+  for (const v of visible) {
+    const gx = (v.sx - ox) / cell, gy = (v.sy - oy) / cell;
+    const ix = Math.floor(gx), iy = Math.floor(gy);
+    if (ix < -STAMP_R || iy < -STAMP_R || ix > gw + STAMP_R || iy > gh + STAMP_R) continue;
+    let g = glowGrids.get(v.t.color);
+    if (!g) { g = { a: new Float32Array(size), rgb: parseColor(v.t.color), used: false }; glowGrids.set(v.t.color, g); }
+    g.used = true;
+    const f = Math.max(0.15, v.z), a = g.a;
+    const y0 = Math.max(0, iy - STAMP_R + 1), y1 = Math.min(gh - 1, iy + STAMP_R);
+    const x0 = Math.max(0, ix - STAMP_R + 1), x1 = Math.min(gw - 1, ix + STAMP_R);
+    for (let y = y0; y <= y1; y++) {
+      const dy = y + 0.5 - gy, row = y * gw;
+      for (let x = x0; x <= x1; x++) {
+        const dx = x + 0.5 - gx, d2 = dx * dx + dy * dy;
+        if (d2 < maxD2) a[row + x] += f * STAMP_LUT[(d2 * STAMP_STEPS) | 0];
+      }
+    }
+  }
+
+  const used = [];
+  for (const g of glowGrids.values()) if (g.used) used.push(g);
+  if (!used.length) return;
+  if (!glowImage) glowImage = gctx.createImageData(gw, gh);
+  const px = glowImage.data, nUsed = used.length;
+  for (let i = 0, o = 0; i < size; i++, o += 4) {
+    let r = 0, gr = 0, b = 0, any = false;
+    for (let u = 0; u < nUsed; u++) {
+      const x = used[u].a[i];
+      if (x < 0.004) continue;
+      any = true;
+      const k = GLOW_LUT[x >= 4 ? 1024 : (x * 256) | 0];
+      const c = used[u].rgb, hot = k * k * k * GLOW_WHITE;
+      r += k * c[0] + hot * (255 - c[0]); gr += k * c[1] + hot * (255 - c[1]); b += k * c[2] + hot * (255 - c[2]);
+    }
+    if (any) { px[o] = r; px[o + 1] = gr; px[o + 2] = b; } else { px[o] = 0; px[o + 1] = 0; px[o + 2] = 0; }
+    px[o + 3] = 255;
+  }
+  gctx.putImageData(glowImage, 0, 0);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = weight;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(glowCanvas, ox, oy, gw * cell, gh * cell);
+  ctx.restore();
+}
+
+/* ---- cursor readout: the right ascension and declination under the mouse pointer (mouse only) ---- */
+let lastGeom = null;                 // globe centre and radius from the latest draw
+let pointerCss = null;               // last mouse position over the globe, in screen pixels
+function updateCursorReadout() {
+  let text = '';
+  if (pointerCss && lastGeom) {
+    const sx = (pointerCss.x * dpr - lastGeom.cx) / lastGeom.R, sy = (lastGeom.cy - pointerCss.y * dpr) / lastGeom.R;
+    const rr = sx * sx + sy * sy, win = lastGeom.win;
+    const inside = pointerCss.x * dpr >= win.x0 && pointerCss.x * dpr <= win.x1 && pointerCss.y * dpr >= win.y0 && pointerCss.y * dpr <= win.y1;
+    if (rr <= 1 && inside) {
+      const z2 = Math.sqrt(1 - rr), cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+      const y = sy * cp + z2 * sp, z = -sy * sp + z2 * cp;
+      const x0 = sx * Math.cos(view.yaw) - z * Math.sin(view.yaw), z0 = sx * Math.sin(view.yaw) + z * Math.cos(view.yaw);
+      const ra = ((Math.atan2(-z0, x0) * 180 / Math.PI) % 360 + 360) % 360;
+      const dec = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+      const totalSec = Math.round(ra / 15 * 3600) % 86400;
+      const hh = Math.floor(totalSec / 3600), mm = Math.floor(totalSec / 60) % 60, ss = totalSec % 60;
+      text = 'RA ' + hh + 'h ' + String(mm).padStart(2, '0') + 'm ' + String(ss).padStart(2, '0') + 's   Dec ' +
+        (dec >= 0 ? '+' : '\u2212') + Math.abs(dec).toFixed(1) + '\u00b0';
+    }
+  }
+  if (cursorReadoutEl.textContent !== text) cursorReadoutEl.textContent = text;
+}
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse') return;
+  const box = canvas.getBoundingClientRect();
+  pointerCss = { x: e.clientX - box.left, y: e.clientY - box.top };
+  updateCursorReadout();
+});
+canvas.addEventListener('pointerleave', () => { pointerCss = null; updateCursorReadout(); });
+
 function draw() {
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -887,6 +1235,19 @@ function draw() {
     cx = w * 0.5; cy = h * 0.52;
     R = Math.min(h * 0.31, w * 0.22) * view.zoom;
   }
+
+  // The frame: how far the globe has outgrown the window, and the window that results (the whole canvas when 0).
+  const frame = frameStrength(cx, cy, R, w, h);
+  let bottomClear = 0;                                                    // the footer bar covers the bottom of the canvas on desktop
+  if (frame > 0.001 && !stackedQuery.matches) {
+    const bar = document.querySelector('.bottom-bar');
+    if (bar) bottomClear = Math.max(0, h - (bar.getBoundingClientRect().top - stage.getBoundingClientRect().top) * dpr);
+  }
+  const inset = FRAME_INSET * dpr * frame;
+  viewWin = { x0: inset, y0: inset, x1: w - inset, y1: h - frame * bottomClear - inset };
+  const frameRadius = FRAME_RADIUS * dpr * frame;
+  ctx.save();
+  if (frame > 0.001) { frameRectPath(viewWin, frameRadius); ctx.clip(); }
 
   // 1. wide painterly ring (behind everything)
   if (!ringTexture) ringTexture = buildRingTexture();
@@ -912,8 +1273,8 @@ function draw() {
 
   drawGraticule(cx, cy, R, view.yaw, view.pitch);
 
-  // 4. markers: front-facing only. Tuned so 10,000+ tokens stay smooth: dots shrink as the
-  // count grows, are batched per collection colour, and labels only appear when few are on screen.
+  // 4. markers: front-facing only. Tuned so 10,000+ tokens stay smooth: dots are batched per collection
+  // colour and edge-fade band, and labels only appear when few are on screen.
   const cyw = Math.cos(view.yaw), syw = Math.sin(view.yaw), cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
   const visible = [];
   let onScreen = 0;
@@ -925,40 +1286,101 @@ function draw() {
     if (z2 <= 0) continue;
     const sx = cx + x1 * R, sy = cy - (u.y * cp - z1 * sp) * R;
     visible.push({ t: tokens[i], sx, sy, z: z2 });
-    if (sx > 0 && sx < w && sy > 0 && sy < h) onScreen++;
+    if (sx > viewWin.x0 && sx < viewWin.x1 && sy > viewWin.y0 && sy < viewWin.y1) onScreen++;
   }
   if (visible.length <= 1500) visible.sort((a, b) => a.z - b.z);   // nearer on top when it matters
 
+  // How crowded is it? Average gap between neighbouring dots, from the globe area that is on screen.
+  const boxW = Math.max(0, Math.min(viewWin.x1, cx + R) - Math.max(viewWin.x0, cx - R));
+  const boxH = Math.max(0, Math.min(viewWin.y1, cy + R) - Math.max(viewWin.y0, cy - R));
+  const clipped = (boxW * boxH) / (4 * R * R);                       // 1 = the whole globe is on screen
+  const discArea = boxW * boxH * (Math.PI / 4 + (1 - Math.PI / 4) * (1 - clipped));
+  const gap = onScreen > 0 ? Math.sqrt(discArea / onScreen) / dpr : Infinity;
+  const dotWeight = onScreen > 0 ? smoothstep((gap - GLOW_ONLY_GAP) / (DOTS_ONLY_GAP - GLOW_ONLY_GAP)) : 1;
+  const clickable = dotWeight >= CLICKABLE_DOT_WEIGHT;
+
+  if (dotWeight < 0.995 && onScreen > 0) drawDensityGlow(visible, cx, cy, R, w, h, discArea, 1 - dotWeight);
+  zoomHintEl.classList.toggle('show', !clickable && onScreen > 0);
+  updateZoomGauge();
+  lastGeom = { cx, cy, R, win: viewWin };
+  updateCursorReadout();
+
   markerHitTargets = [];
   const n = tokens.length;
-  const sizeFactor = n > 3000 ? 0.38 : n > 1000 ? 0.55 : n > 300 ? 0.75 : 1;
-  const dotR = Math.max(1.5, Math.min(6, R * 0.02 * sizeFactor)) * dpr;
+  const boost = zoomDotBoost(view.zoom);
+  const dotR = Math.max(MIN_DOT_PX, dotBasePx(n) * zoomDotScale(view.zoom)) * boost * dpr;
   const hitPad = (n > 1000 ? 3 : 6) * dpr;
+  const minHit = 5 * dpr;
 
-  const byColor = new Map();
-  for (const v of visible) {
-    if (v.sx < -20 || v.sx > w + 20 || v.sy < -20 || v.sy > h + 20) continue;
-    let path = byColor.get(v.t.color);
-    if (!path) { path = new Path2D(); byColor.set(v.t.color, path); }
-    path.moveTo(v.sx + dotR, v.sy);
-    path.arc(v.sx, v.sy, dotR, 0, Math.PI * 2);
-    markerHitTargets.push({ token: v.t, sx: v.sx, sy: v.sy, r: dotR + hitPad });
-  }
-  for (const [color, path] of byColor) {
-    ctx.fillStyle = color;
-    ctx.fill(path);
-    if (n <= 1500) {
-      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-      ctx.lineWidth = 1;
-      ctx.stroke(path);
+  if (dotWeight > 0.02) {
+    const byColor = new Map();     // colour -> one path per edge-fade band
+    for (const v of visible) {
+      if (v.sx < -20 || v.sx > w + 20 || v.sy < -20 || v.sy > h + 20) continue;
+      let paths = byColor.get(v.t.color);
+      if (!paths) { paths = EDGE_BANDS.map(() => new Path2D()); byColor.set(v.t.color, paths); }
+      const bi = edgeBand(v.z);
+      const r = Math.max(0.7 * dpr, dotR * EDGE_BANDS[bi].size);
+      paths[bi].moveTo(v.sx + r, v.sy);
+      paths[bi].arc(v.sx, v.sy, r, 0, Math.PI * 2);
+      if (clickable && inViewWin(v.sx, v.sy, 0)) markerHitTargets.push({ token: v.t, sx: v.sx, sy: v.sy, r: Math.max(r + hitPad, minHit) });
+    }
+    for (const [color, paths] of byColor) {
+      ctx.fillStyle = color;
+      for (let bi = 0; bi < paths.length; bi++) {
+        ctx.globalAlpha = dotWeight * EDGE_BANDS[bi].alpha;
+        ctx.fill(paths[bi]);
+        if (n <= 1500) {
+          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ctx.lineWidth = 1;
+          ctx.stroke(paths[bi]);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    const phone = stackedQuery.matches;
+    const labelBelow = phone ? LABEL_BELOW_COUNT_PHONE : LABEL_BELOW_COUNT;
+    if (showNumbers && clickable && (onScreen < labelBelow || (!phone && view.zoom >= LABEL_DEEP_ZOOM && onScreen <= LABEL_DEEP_COUNT))) {
+      ctx.font = (14.5 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#e8eaed';
+      for (const m of markerHitTargets) ctx.fillText('#' + m.token.id, m.sx + dotR + 4, m.sy);
     }
   }
 
-  if (onScreen <= 150 || (view.zoom >= 2.5 && onScreen <= 400)) {
-    ctx.font = (11 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#e8eaed';
-    for (const m of markerHitTargets) ctx.fillText('#' + m.token.id, m.sx + dotR + 4, m.sy);
+  // Frame finishing: a soft vignette inside the window, then (outside the clip) the thin border.
+  if (frame > 0.001) {
+    const mx = (viewWin.x0 + viewWin.x1) / 2, my = (viewWin.y0 + viewWin.y1) / 2;
+    const corner = Math.hypot(viewWin.x1 - mx, viewWin.y1 - my);
+    const vg = ctx.createRadialGradient(mx, my, corner * 0.45, mx, my, corner);
+    vg.addColorStop(0, 'rgba(4, 6, 10, 0)');
+    vg.addColorStop(1, 'rgba(4, 6, 10, ' + (FRAME_VIGNETTE * frame) + ')');
+    ctx.fillStyle = vg;
+    ctx.fillRect(viewWin.x0, viewWin.y0, viewWin.x1 - viewWin.x0, viewWin.y1 - viewWin.y0);
+
+    // Fade every edge to dark, strongest at the border and easing off toward the middle.
+    const fadeW = Math.min(FRAME_FADE * dpr, (viewWin.x1 - viewWin.x0) / 2, (viewWin.y1 - viewWin.y0) / 2);
+    const edge = (x0, y0, x1, y1, gx0, gy0, gx1, gy1) => {
+      const g = ctx.createLinearGradient(gx0, gy0, gx1, gy1);
+      const a = FRAME_FADE_DARK * frame;
+      g.addColorStop(0, 'rgba(4, 6, 10, ' + a + ')');
+      g.addColorStop(0.4, 'rgba(4, 6, 10, ' + (a * 0.4) + ')');
+      g.addColorStop(1, 'rgba(4, 6, 10, 0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    };
+    const { x0, y0, x1, y1 } = viewWin;
+    edge(x0, y0, x1, y0 + fadeW, 0, y0, 0, y0 + fadeW);          // top
+    edge(x0, y1 - fadeW, x1, y1, 0, y1, 0, y1 - fadeW);          // bottom
+    edge(x0, y0, x0 + fadeW, y1, x0, 0, x0 + fadeW, 0);          // left
+    edge(x1 - fadeW, y0, x1, y1, x1, 0, x1 - fadeW, 0);          // right
+  }
+  ctx.restore();
+  if (frame > 0.001) {
+    frameRectPath(viewWin, frameRadius);
+    ctx.strokeStyle = 'rgba(223, 217, 181, ' + (0.55 * frame) + ')';
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.stroke();
   }
 }
 
@@ -970,7 +1392,7 @@ const pointers = new Map();     // pointerId -> {x, y}
 let moveAcc = 0, dragMoved = false, tapCandidate = false;
 let pinchStartDist = 0, pinchStartZoom = 1;
 
-function clampZoom(z) { return Math.max(0.4, Math.min(4, z)); }
+function clampZoom(z) { return Math.max(MIN_ZOOM, Math.min(maxZoom(), z)); }
 
 canvas.addEventListener('pointerdown', (e) => {
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -995,8 +1417,9 @@ window.addEventListener('pointermove', (e) => {
     const dx = cur.x - prev.x, dy = cur.y - prev.y;
     moveAcc += Math.abs(dx) + Math.abs(dy);
     if (moveAcc > 6) dragMoved = true;
-    view.yaw += dx * 0.006;
-    view.pitch = Math.max(-1.5, Math.min(1.5, view.pitch + dy * 0.006));
+    const turn = DRAG_RADIANS_PER_PX / Math.max(1, view.zoom);   // slower per pixel as you zoom in, so the surface moves at the same on-screen speed
+    view.yaw += dx * turn;
+    view.pitch = Math.max(-1.5, Math.min(1.5, view.pitch + dy * turn));
     draw();
   } else if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
@@ -1317,6 +1740,7 @@ loadBtn.addEventListener('click', addCollection);
 // the page falls back to the live-RPC loader used for local Anvil testing. Add ?dev to the
 // address to force that loader.
 let config = null;
+const LEARN_HOW_URL = 'https://larkworkshop.gitbook.io/the-follies-project/morphology/morphology-ra-declination';
 
 function parseRa(str) {
   const m = /^(\d+):(\d+):(\d+)$/.exec(str);
@@ -1422,8 +1846,15 @@ async function initApp() {
   document.body.classList.remove('booting');
   if (usable) {
     document.body.classList.add('public-mode');
-    document.getElementById('subtitle').textContent =
-      config.subtitle || 'Every Folly, plotted by its on-chain Equatorial Coordinates onto a rotatable globe.';
+    const sub = document.getElementById('subtitle');
+    sub.textContent = (config.subtitle || 'Every Folly, plotted by its on-chain Equatorial Coordinates onto a rotatable globe.') + ' ';
+    const learn = document.createElement('a');
+    learn.href = LEARN_HOW_URL;
+    learn.target = '_blank';
+    learn.rel = 'noopener noreferrer';
+    learn.textContent = 'Learn How';
+    sub.appendChild(learn);
+    sub.appendChild(document.createTextNode('.'));
     await loadSnapshot();
   }
 }

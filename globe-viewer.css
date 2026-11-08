@@ -104,6 +104,43 @@ body {
   text-shadow: 1px 1px 3px rgba(0,0,0,0.85);
 }
 
+/* the "Learn how." link after the subtitle (the title block ignores the mouse, so the link opts back in) */
+.title-block .subtitle a {
+  color: var(--cream);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  pointer-events: auto;
+}
+.title-block .subtitle a:hover, .title-block .subtitle a:focus-visible { color: #fff; }
+
+/* zoom gauge: left edge, centred, grows both ways with zoom (positioned and sized by the script) */
+.zoom-gauge {
+  position: absolute;
+  left: 28px;
+  width: 8px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--cream);
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+/* shown while the globe is zoomed out far enough that only the density glow is visible */
+.zoom-hint {
+  position: absolute;
+  left: 50%; bottom: 62px;
+  transform: translateX(-50%);
+  color: var(--cream);
+  font-family: var(--body);
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  text-shadow: 1px 1px 3px rgba(0,0,0,0.85);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  pointer-events: none;
+}
+.zoom-hint.show { opacity: 0.8; }
+
 /* ---- right column: load card + collections legend (fixed upper right) ---- */
 .right-col {
   position: fixed;
@@ -333,18 +370,12 @@ body.public-mode .legend .legend-remove { display: none; }
 
 /* Order & Use filters */
 .adv-filters { margin: 0 0 8px 0; padding-bottom: 8px; border-bottom: 1px solid rgba(236, 220, 176, 0.18); }
-.adv-filters summary {
-  cursor: pointer;
+.adv-title {
   font-family: var(--body);
   font-size: 13px;
   letter-spacing: 0.04em;
   color: var(--cream);
-  list-style: none;
-  user-select: none;
 }
-.adv-filters summary::-webkit-details-marker { display: none; }
-.adv-filters summary::before { content: '\25B8'; display: inline-block; width: 1em; color: rgba(236, 220, 176, 0.7); }
-.adv-filters[open] summary::before { content: '\25BE'; }
 .adv-badge { margin-left: 6px; color: #5fd3a1; font-size: 12px; letter-spacing: 0; }
 .fgroup { margin-top: 10px; }
 .fgroup-head {
@@ -365,6 +396,7 @@ body.public-mode .legend .legend-remove { display: none; }
   cursor: pointer;
 }
 .fbtns button:hover { border-color: var(--cream); }
+.fbtns button.is-off { border-color: #f5c85c; color: #f5c85c; }
 .checks { display: grid; grid-template-columns: 1fr; gap: 3px 10px; }
 .checks.two-col { grid-template-columns: 1fr 1fr; grid-auto-flow: column; grid-template-rows: repeat(9, auto); }
 .chk {
@@ -449,6 +481,7 @@ body.public-mode .load-card { display: none; }
     flex: 0 0 auto;
     margin-top: 8px;
   }
+  .zoom-hint { bottom: 10px; }
   .bottom-bar {
     position: relative;
     margin-top: auto;
