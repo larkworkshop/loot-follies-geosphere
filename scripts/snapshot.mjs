@@ -12,8 +12,11 @@
 // they cannot end up in a log even if a library puts the address in an error message.
 //
 // Env (all optional except one of ALCHEMY_KEY / RPC_URL):
-//   CONFIG=config.json   OUT=data/snapshot.json   CONCURRENCY=5   CONFIRMATIONS=3
-//   LOG_CHUNK_BLOCKS=2000   MAX_AGE_HOURS=24   FULL_REFRESH=0
+//   CONFIG=config.json   OUT=data/snapshot.json   CONCURRENCY=3   CONFIRMATIONS=3
+//   LOG_CHUNK_BLOCKS=10   MAX_AGE_HOURS=24   FULL_REFRESH=0
+//
+// A token whose metadata cannot be read right now (for example because the provider is throttling) does not
+// stop the run: it is listed under retryIds in the snapshot and read again on every later run.
 import fs from 'node:fs';
 import path from 'node:path';
 import { inspect } from 'node:util';
@@ -30,7 +33,8 @@ function redact(text) {
   for (const sec of SECRETS) out = out.split(sec).join('[redacted]');
   return out;
 }
-const safeMessage = (e) => redact((e && (e.shortMessage || e.message)) || e);
+const safeMessage = (e) => redact(nodeMessage(e) || String(e));
+const warn = (msg) => console.log(process.env.GITHUB_ACTIONS ? `::warning::${msg}` : `WARNING: ${msg}`);
 
 addSecret(process.env.RPC_URL);
 addSecret(process.env.ALCHEMY_KEY);
@@ -65,9 +69,9 @@ function resolveRpcUrl(chainId) {
 const CONFIG_PATH = process.env.CONFIG || 'config.json';
 const OUT_PATH = process.env.OUT || 'data/snapshot.json';
 const FULL = ['1', 'true'].includes(String(process.env.FULL_REFRESH || '').toLowerCase());
-const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 5));
+const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 3));
 const CONFIRMATIONS = Math.max(0, Number(process.env.CONFIRMATIONS || 3));
-const LOG_CHUNK = Math.max(1, Number(process.env.LOG_CHUNK_BLOCKS || 2000));
+const LOG_CHUNK = Math.max(1, Number(process.env.LOG_CHUNK_BLOCKS || 10));
 const MAX_AGE_MS = Number(process.env.MAX_AGE_HOURS || 24) * 3600 * 1000;
 
 const ABI = [
@@ -80,15 +84,38 @@ const ABI = [
 ];
 const TRANSFER_TOPIC = keccak256('Transfer(address,address,uint256)');
 
+let learnedChunk = LOG_CHUNK;   // the log window that last worked; shared by every collection in this run
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-async function retry(fn, label, tries = 6) {
+
+/* Ethers reports ANY error the node returns for a read call as CALL_EXCEPTION ("missing revert data"), even a
+   throttling error, so the label alone cannot be trusted. Look at what the provider actually said. */
+function nodeMessage(e) {
+  const inner = e && ((e.info && e.info.error && e.info.error.message) || (e.error && e.error.message));   // what the provider itself said
+  const parts = [e && (e.shortMessage || e.message), inner, e && e.info && e.info.responseStatus];
+  return [...new Set(parts.filter(Boolean).map(String))].join(' | ');
+}
+function isMonthlyCap(e) { return /monthly capacity limit|monthly.*(limit|cap)/i.test(nodeMessage(e)); }
+function isThrottle(e) {
+  if (isMonthlyCap(e)) return false;                       // retrying will not help until the month rolls over
+  const codes = [e && e.info && e.info.error && e.info.error.code, e && e.error && e.error.code, e && e.status];
+  if (codes.some(c => Number(c) === 429)) return true;
+  return /\b429\b|compute units per second|throughput|rate.?limit|too many requests|exceeded.*(capacity|retry limit)/i.test(nodeMessage(e));
+}
+const hasRevertData = (e) => !!(e && e.data && e.data !== '0x');   // a real revert carries data; "missing revert data" does not
+
+async function retry(fn, label, tries = 6, { throttleOnly = false } = {}) {
   let delay = 500;
   for (let i = 1; ; i++) {
     try { return await fn(); }
     catch (e) {
-      if (e && e.code === 'CALL_EXCEPTION') throw e;       // a revert won't get better by retrying
-      if (i >= tries) throw new Error(`${label}: ${safeMessage(e)}`);
-      await sleep(delay); delay = Math.min(delay * 2, 15000);
+      const throttled = isThrottle(e);
+      if (throttleOnly && !throttled) throw e;                                  // the caller handles other errors itself
+      if (e && e.code === 'CALL_EXCEPTION' && !throttled) {
+        if (hasRevertData(e) || i >= 3) throw e;                                // a real revert will not get better; an unexplained one gets a couple more tries
+      } else if (i >= (throttled ? 10 : tries)) {                               // throttling gets more patience than other errors
+        throw new Error(`${label}: ${redact(nodeMessage(e))}`);
+      }
+      await sleep(delay + Math.floor(Math.random() * 250)); delay = Math.min(delay * 2, 15000);
     }
   }
 }
@@ -149,40 +176,55 @@ async function processCollection(cfg, provider, prev, head, chainId) {
   const tokens = new Map();      // id -> { owner, ra, dec, order, use, name }
   const skippedIds = new Set();  // tokens without usable coordinates
 
+  const retryLater = new Set();  // tokens that could not be read this time; kept in the snapshot and tried again next run
+
   const fetchToken = async (id) => {
     let owner;
     try { owner = await retry(() => contract.ownerOf(id), `ownerOf(${id})`); }
-    catch (e) { if (e.code === 'CALL_EXCEPTION') return; throw e; }   // burned or never existed
-    const uri = await retry(() => contract.tokenURI(id), `tokenURI(${id})`);
+    catch (e) {
+      if (e.code === 'CALL_EXCEPTION' && hasRevertData(e)) return;     // a genuine revert: burned or never existed
+      warn(`${name} token ${id}: could not read the owner right now (${safeMessage(e)}); will try again on the next run`);
+      retryLater.add(id); return;
+    }
+    let uri;
+    try { uri = await retry(() => contract.tokenURI(id), `tokenURI(${id})`); }
+    catch (e) {
+      warn(`${name} token ${id}: could not read tokenURI right now (${safeMessage(e)}); will try again on the next run`);
+      retryLater.add(id); return;
+    }
     let fields = null;
     try { fields = parseTrackedFields(decodeTokenURI(uri)); } catch { /* not plottable */ }
     if (fields) { tokens.set(id, { owner: getAddress(owner), ...fields }); skippedIds.delete(id); }
     else { skippedIds.add(id); tokens.delete(id); }
+    retryLater.delete(id);
   };
 
   let lastBlock;
   if (prev && !FULL) {
     for (const r of prev.tokens) tokens.set(String(r[0]), { owner: getAddress(prev.owners[r[1]]), ra: r[2], dec: r[3], order: r[4], use: r[5], name: r[6] || '' });
     for (const id of prev.skippedIds || []) skippedIds.add(String(id));
+    for (const id of prev.retryIds || []) retryLater.add(String(id));
     lastBlock = prev.lastBlock;
     console.log(`${name}: ${tokens.size} tokens in previous snapshot; replaying blocks ${lastBlock + 1}..${toBlock}`);
 
     const events = [];
-    let from = lastBlock + 1, chunk = LOG_CHUNK;
+    let from = lastBlock + 1, chunk = learnedChunk;
     while (from <= toBlock) {
       const to = Math.min(from + chunk - 1, toBlock);
       try {
         const query = () => provider.getLogs({ address, topics: [TRANSFER_TOPIC], fromBlock: from, toBlock: to });
         // A refused range is most likely a provider block-range cap: shrink the window rather than retry it.
-        const logs = chunk === 1 ? await retry(query, 'getLogs') : await query();
+        // Throttling is waited out and the same window retried; only another kind of refusal shrinks the window.
+        const logs = chunk === 1 ? await retry(query, 'getLogs') : await retry(query, 'getLogs', 6, { throttleOnly: true });
         events.push(...logs);
         from = to + 1;
       } catch (e) {
         if (chunk === 1) throw e;
         chunk = Math.max(1, Math.floor(chunk / 2));
-        console.log(`  getLogs refused the range, retrying with ${chunk} blocks`);
+        console.log(`  getLogs refused the range (${safeMessage(e).slice(0, 90)}), retrying with ${chunk} blocks`);
       }
     }
+    learnedChunk = chunk;
     events.sort((a, b) => a.blockNumber - b.blockNumber || a.index - b.index);
 
     const pending = new Set();
@@ -191,12 +233,13 @@ async function processCollection(cfg, provider, prev, head, chainId) {
       const fromAddr = getAddress('0x' + l.topics[1].slice(26));
       const toAddr = getAddress('0x' + l.topics[2].slice(26));
       const id = BigInt(l.topics[3]).toString();
-      if (toAddr === ZeroAddress) { tokens.delete(id); skippedIds.delete(id); pending.delete(id); continue; }
+      if (toAddr === ZeroAddress) { tokens.delete(id); skippedIds.delete(id); pending.delete(id); retryLater.delete(id); continue; }
       if (tokens.has(id)) tokens.get(id).owner = toAddr;
       else if (skippedIds.has(id)) continue;
       else pending.add(id);
       void fromAddr;
     }
+    for (const id of retryLater) if (!tokens.has(id) && !skippedIds.has(id)) pending.add(id);   // earlier failures get another go
     console.log(`  ${events.length} transfer event(s); ${pending.size} new/unknown token(s) to read`);
     await pool([...pending], CONCURRENCY, fetchToken);
   } else {
@@ -216,7 +259,9 @@ async function processCollection(cfg, provider, prev, head, chainId) {
     return [idOut, ownerIdx.get(t.owner), t.ra, t.dec, t.order, t.use, t.name];
   });
   const skipped = [...skippedIds].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)).map(x => (Number.isSafeInteger(Number(x)) ? Number(x) : x));
-  return { address, name, symbol, chainId, lastBlock, skipped: skipped.length, skippedIds: skipped, owners, tokens: rows };
+  const retryIds = [...retryLater].filter(x => !tokens.has(x)).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)).map(x => (Number.isSafeInteger(Number(x)) ? Number(x) : x));
+  if (retryIds.length) warn(`${name}: ${retryIds.length} token(s) could not be read this run and will be retried: ${retryIds.join(', ')}`);
+  return { address, name, symbol, chainId, lastBlock, skipped: skipped.length, skippedIds: skipped, retryIds, owners, tokens: rows };
 }
 
 /* ---- main ---- */
@@ -243,7 +288,7 @@ async function main() {
 
   // Skip the write (and so the commit) when nothing changed, except for a periodic refresh
   // that keeps lastBlock and the "updated" time from going stale.
-  const sig = (cols) => JSON.stringify((cols || []).map(c => [c.address, c.name, c.symbol, c.owners, c.tokens, c.skippedIds]));
+  const sig = (cols) => JSON.stringify((cols || []).map(c => [c.address, c.name, c.symbol, c.owners, c.tokens, c.skippedIds, c.retryIds || []]));
   const prevAge = prevSnap && prevSnap.generatedAt ? Date.now() - Date.parse(prevSnap.generatedAt) : Infinity;
   if (prevSnap && !FULL && sig(prevSnap.collections) === sig(out) && prevAge < MAX_AGE_MS) {
     console.log('No changes since the last snapshot; leaving the file as is.');
