@@ -78,8 +78,8 @@
 <div class="bottom-bar">
   <a href="https://www.folliesproject.com/" target="_blank" rel="noopener noreferrer">The Follies Project</a>
   <span>
-    <span class="hint-mouse">Drag to rotate &nbsp;|&nbsp; Scroll to zoom &nbsp;|&nbsp; Click marker for details</span>
-    <span class="hint-touch">Drag to rotate &nbsp;|&nbsp; Pinch to zoom &nbsp;|&nbsp; Tap marker for details</span>
+    <span class="hint-mouse">Drag to rotate &nbsp;|&nbsp; Scroll to zoom &nbsp;|&nbsp; Click marker for details &nbsp;|&nbsp; Data from timed snapshot, Artwork directly from chain</span>
+    <span class="hint-touch">Drag to rotate &nbsp;|&nbsp; Pinch to zoom &nbsp;|&nbsp; Tap marker for details &nbsp;|&nbsp; Data from timed snapshot, Artwork directly from chain</span>
   </span>
 </div>
 
@@ -94,7 +94,6 @@
       <div class="popup-name" id="popupName"></div>
       <div class="popup-row" id="popupCollection"></div>
       <div class="popup-row" id="popupId"></div>
-      <div class="popup-row" id="popupOwner"></div>
       <div class="popup-row" id="popupCoords"></div>
       <div class="popup-row" id="popupTraits"></div>
     </div>
@@ -209,6 +208,19 @@ function decodeDataUri(uri) {
 const IFRAME_SVG_SHELL_HEAD = '<!doctype html><html><head><meta charset="utf-8"/><style>html, body { margin: 0; padding: 0; background: black; width: 100%; height: 100%; } svg { width: 100%; height: 100%; }</style><\/head><body>';
 const IFRAME_SVG_SHELL_TAIL = '<\/body><\/html>';
 
+// The token's own page is shown in a square frame; its default 8 px body margin makes it a little taller than
+// the frame, which produced a scrollbar. This rule is placed before the page's own markup and removes both.
+const IFRAME_PAGE_RESET = '<style>html, body { margin: 0; overflow: hidden; }<\/style>';
+// Slot the rule in after the page's <head> (or <html>) tag so the page's own doctype stays first; a style
+// block in front of the doctype would push the artwork into quirks mode and change how it lays out.
+function withPageReset(html) {
+  const head = /<head[^>]*>/i.exec(html);
+  if (head) return html.slice(0, head.index + head[0].length) + IFRAME_PAGE_RESET + html.slice(head.index + head[0].length);
+  const root = /<html[^>]*>/i.exec(html);
+  if (root) return html.slice(0, root.index + root[0].length) + IFRAME_PAGE_RESET + html.slice(root.index + root[0].length);
+  return IFRAME_PAGE_RESET + html;
+}
+
 function buildIframe(srcdocHtml) {
   const iframe = document.createElement('iframe');
   iframe.setAttribute('sandbox', '');
@@ -221,7 +233,7 @@ function buildVisualNode(metadata) {
   if (metadata.animation_url) {
     if (metadata.animation_url.startsWith("data:")) {
       const decoded = decodeDataUri(metadata.animation_url);
-      if (decoded) return buildIframe(decoded.text);
+      if (decoded) return buildIframe(withPageReset(decoded.text));
     } else {
       const iframe = document.createElement('iframe');
       iframe.setAttribute('sandbox', '');
@@ -339,7 +351,7 @@ function parseUseTrait(v) {
 }
 function useGroupOf(use) { return use === null || use === undefined ? null : Math.floor(use / 4); }
 function describeOrder(o) { return o === null || o === undefined ? '' : (o === 'U' ? 'Unordered' : ORDER_NAMES[o]); }
-function describeUse(u) { return u === null || u === undefined ? '' : USE_GROUPS[useGroupOf(u)].label + ' (' + u + ')'; }
+function describeUse(u) { return u === null || u === undefined ? '' : USE_GROUPS[useGroupOf(u)].label.replace(/\s+Impact$/i, ''); }   // the click popup drops the word "Impact"; the filter card keeps the full label
 
 function makeToken(f) {
   return {
@@ -1469,7 +1481,6 @@ const popupVisual = document.getElementById('popupVisual');
 const popupName = document.getElementById('popupName');
 const popupCollection = document.getElementById('popupCollection');
 const popupId = document.getElementById('popupId');
-const popupOwner = document.getElementById('popupOwner');
 const popupCoords = document.getElementById('popupCoords');
 const popupTraits = document.getElementById('popupTraits');
 const popupCloseBtn = document.getElementById('popupCloseBtn');
@@ -1483,7 +1494,6 @@ async function openPopup(token) {
   const c = token.collection;
   popupCollection.textContent = c ? (c.name || 'Collection') + (c.symbol ? ' (' + c.symbol + ')' : '') : '';
   popupId.textContent = 'Token ID: ' + token.id;
-  popupOwner.textContent = token.owner;
   popupCoords.textContent = token.coords ? token.coords.raw : 'No coordinates found';
   const bits = [];
   if (token.order !== null) bits.push('Order: ' + describeOrder(token.order));
@@ -1493,15 +1503,13 @@ async function openPopup(token) {
 
   if (meta) { popupVisual.appendChild(buildVisualNode(meta)); return; }
 
-  // Snapshot tokens carry no artwork: fetch this one token live (tokenURI + current owner).
+  // Snapshot tokens carry no artwork: fetch this one token live (tokenURI only).
   popupVisual.textContent = 'Loading artwork…';
   try {
     await ensureLiveMetadata(token);
     if (popupToken !== token) return;
     popupVisual.innerHTML = '';
     popupVisual.appendChild(buildVisualNode(token.metadata));
-    popupOwner.textContent = token.owner;
-    if (token.metadata.name) popupName.textContent = token.metadata.name;   // e.g. "Folly #1"; the snapshot only holds the place name
   } catch (e) {
     if (popupToken !== token) return;
     popupVisual.textContent = 'Could not load the artwork right now (' + String(e.message || e).slice(0, 80) + ').';
@@ -1555,7 +1563,6 @@ async function ensureLiveMetadata(token) {
   const hit = cache[key];
   if (hit && Date.now() - hit.t < META_CACHE_TTL_MS && hit.m) {
     token.metadata = hit.m;
-    if (hit.o) token.owner = hit.o;
     return;
   }
 
@@ -1565,14 +1572,10 @@ async function ensureLiveMetadata(token) {
   for (const url of urls) {
     try {
       const contract = new ethers.Contract(token.collection.address, ERC721_ABI, liveProvider(url));
-      const [uri, owner] = await Promise.all([
-        contract.tokenURI(token.id),
-        contract.ownerOf(token.id).catch(() => null)   // a missing owner keeps the snapshot's value
-      ]);
+      const uri = await contract.tokenURI(token.id);   // one RPC call per click; the owner comes from the snapshot
       token.metadata = decodeTokenURI(uri);
-      if (owner) token.owner = owner;
       const fresh = readMetaCache();
-      fresh[key] = { t: Date.now(), m: token.metadata, o: token.owner };
+      fresh[key] = { t: Date.now(), m: token.metadata };
       writeMetaCache(fresh);
       return;
     } catch (e) { lastErr = e; }
