@@ -2,7 +2,7 @@
   "chainId": 11155111,
   "snapshotUrl": "data/snapshot.json",
   "rpcUrls": [
-    "https://YOUR-LAMBDA-URL.lambda-url.us-east-1.on.aws/",
+    "https://gslsezdezhz77ruks4eq5wekau0wurpr.lambda-url.us-east-2.on.aws/",
     "https://ethereum-sepolia-rpc.publicnode.com",
     "https://sepolia.drpc.org"
   ],
